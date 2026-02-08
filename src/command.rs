@@ -19,6 +19,7 @@ pub struct CommandExecutor {
     store: Store,
     stats: Arc<ServerStats>,
     listen_addr: String,
+    max_memory_bytes: Option<u64>,
 }
 
 pub enum SessionAction {
@@ -27,12 +28,19 @@ pub enum SessionAction {
 }
 
 impl CommandExecutor {
-    pub fn new(auth: Auth, store: Store, stats: Arc<ServerStats>, listen_addr: String) -> Self {
+    pub fn new(
+        auth: Auth,
+        store: Store,
+        stats: Arc<ServerStats>,
+        listen_addr: String,
+        max_memory_bytes: Option<u64>,
+    ) -> Self {
         Self {
             auth,
             store,
             stats,
             listen_addr,
+            max_memory_bytes,
         }
     }
 
@@ -76,6 +84,19 @@ impl CommandExecutor {
             );
         }
 
+        if self.max_memory_bytes.is_some() && is_memory_growing_command(&cmd) {
+            let limit = self.max_memory_bytes.unwrap_or(u64::MAX) as usize;
+            let used = self.store.metrics().await.approx_memory_bytes;
+            if used >= limit {
+                return (
+                    RespValue::Error(
+                        "OOM command not allowed when used memory > 'maxmemory'".to_string(),
+                    ),
+                    SessionAction::Continue,
+                );
+            }
+        }
+
         match cmd.as_str() {
             "PING" => self.ping(&args),
             "ECHO" => self.echo(&args),
@@ -83,6 +104,8 @@ impl CommandExecutor {
             "AUTH" => self.auth_cmd(&args, session),
             "HELLO" => self.hello(&args, session),
             "CLIENT" => self.client(&args, session).await,
+            "ACL" => self.acl(&args, session),
+            "MODULE" => self.module_cmd(&args),
             "COMMAND" => self.command_meta(&args),
             "CONFIG" => self.config_cmd(&args),
             "LATENCY" => self.latency(&args),
@@ -144,6 +167,27 @@ impl CommandExecutor {
     pub fn record_command_stats(&self, command: &str, elapsed_usec: u64) {
         self.stats.record_command(command, elapsed_usec);
     }
+}
+
+fn is_memory_growing_command(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "SET"
+            | "SETEX"
+            | "PSETEX"
+            | "SETNX"
+            | "MSET"
+            | "MSETNX"
+            | "APPEND"
+            | "SETRANGE"
+            | "GETSET"
+            | "UPDATE"
+            | "INCR"
+            | "INCRBY"
+            | "DECR"
+            | "DECRBY"
+            | "JSON.SET"
+    )
 }
 
 pub(super) fn parse_u64(bytes: &[u8]) -> Option<u64> {

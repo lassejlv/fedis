@@ -5,13 +5,14 @@ use std::time::Instant;
 
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::auth::{Auth, SessionAuth};
 use crate::command::{CommandExecutor, SessionAction};
 use crate::config::Config;
 use crate::persistence::Aof;
-use crate::protocol::{RespValue, encode, frame_to_args, read_frame};
+use crate::protocol::{ReadLimits, RespValue, encode, frame_to_args, read_frame_with_limits};
 use crate::stats::ServerStats;
 use crate::store::Store;
 
@@ -34,6 +35,7 @@ impl Server {
             store.clone(),
             stats.clone(),
             config.listen_addr.clone(),
+            config.max_memory_bytes,
         ));
         Ok(Self {
             config,
@@ -99,6 +101,7 @@ impl Server {
         });
 
         let mut shutdown = std::pin::pin!(tokio::signal::ctrl_c());
+        let limit = Arc::new(Semaphore::new(self.config.max_connections.max(1)));
         loop {
             let accept_result = tokio::select! {
                 _ = &mut shutdown => {
@@ -109,10 +112,20 @@ impl Server {
             };
 
             let (socket, peer_addr) = accept_result?;
+            let Ok(permit) = limit.clone().try_acquire_owned() else {
+                warn!(peer = %peer_addr, "connection rejected: max connections reached");
+                let mut socket = socket;
+                let _ = socket
+                    .write_all(b"-ERR max number of clients reached\r\n")
+                    .await;
+                continue;
+            };
             let executor = self.executor.clone();
             let stats = self.stats.clone();
             let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
             let with_response_ids = self.config.non_redis_mode && self.config.debug_response_ids;
+            let max_request_bytes = self.config.max_request_bytes;
+            let idle_timeout = Duration::from_secs(self.config.idle_timeout_sec.max(1));
             stats.on_connect();
             info!(connection_id, peer = %peer_addr, "client connected");
             tokio::spawn(async move {
@@ -122,12 +135,15 @@ impl Server {
                     connection_id,
                     peer_addr,
                     with_response_ids,
+                    max_request_bytes,
+                    idle_timeout,
                 )
                 .await
                 {
                     warn!(connection_id, peer = %peer_addr, error = %e, "client loop failed");
                 }
                 stats.on_disconnect();
+                drop(permit);
                 info!(connection_id, peer = %peer_addr, "client disconnected");
             });
         }
@@ -250,20 +266,52 @@ async fn handle_client(
     connection_id: u64,
     peer_addr: std::net::SocketAddr,
     with_response_ids: bool,
+    max_request_bytes: usize,
+    idle_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (reader_half, writer_half) = socket.into_split();
     let mut reader = BufReader::new(reader_half);
     let mut writer = writer_half;
     let mut session = SessionAuth::default();
     let mut request_id = 0_u64;
+    let read_limits = ReadLimits {
+        max_bulk_bytes: max_request_bytes,
+        max_array_len: 4096,
+        max_line_bytes: 4096,
+    };
 
     loop {
-        let Some(frame) = read_frame(&mut reader).await? else {
-            break;
+        let frame = match tokio::time::timeout(
+            idle_timeout,
+            read_frame_with_limits(&mut reader, read_limits),
+        )
+        .await
+        {
+            Ok(Ok(Some(frame))) => frame,
+            Ok(Ok(None)) => break,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                info!(connection_id, peer = %peer_addr, "client idle timeout");
+                break;
+            }
         };
 
         let response = match frame_to_args(frame) {
             Ok(args) => {
+                let request_bytes: usize = args.iter().map(|v| v.len()).sum();
+                if request_bytes > max_request_bytes {
+                    warn!(
+                        connection_id,
+                        peer = %peer_addr,
+                        bytes = request_bytes,
+                        limit = max_request_bytes,
+                        "request too large"
+                    );
+                    let resp = RespValue::Error("ERR request is too large".to_string());
+                    let encoded = encode(resp);
+                    writer.write_all(&encoded).await?;
+                    continue;
+                }
                 request_id = request_id.saturating_add(1);
                 let command = command_name(&args);
                 let arg_count = args.len();

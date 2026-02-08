@@ -20,6 +20,7 @@ async fn make_executor() -> (CommandExecutor, SessionAuth, PathBuf) {
         store,
         Arc::new(ServerStats::new()),
         "127.0.0.1:0".to_string(),
+        None,
     );
     (executor, SessionAuth::default(), path)
 }
@@ -271,6 +272,23 @@ async fn json_rejects_non_root_path() {
 
     let err = expect_error(run(&executor, &mut session, &["JSON.GET", "j", "$.a"]).await);
     assert_eq!(err, "ERR only root path is supported");
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn acl_whoami_and_module_list_work() {
+    let (executor, mut session, path) = make_executor().await;
+
+    assert_eq!(
+        expect_bulk(run(&executor, &mut session, &["ACL", "WHOAMI"]).await),
+        Some(b"default".to_vec())
+    );
+    let module = run(&executor, &mut session, &["MODULE", "LIST"]).await;
+    match module {
+        RespValue::Array(v) => assert!(v.is_empty()),
+        _ => panic!("expected array response"),
+    }
 
     let _ = std::fs::remove_file(path);
 }

@@ -1,0 +1,31 @@
+name: Perf Regression
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+
+jobs:
+  perf:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run suite
+        run: python3 benchmarks/run_suite.py
+
+      - name: Check thresholds
+        run: python3 benchmarks/check_regression.py
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: fedis-bench-results
+          path: benchmarks/latest_results.json

@@ -14,13 +14,14 @@
 - JSON v1 root-path commands (`JSON.SET`, `JSON.GET`, `JSON.DEL`, `JSON.TYPE`)
 - AOF persistence with fsync modes and `BGREWRITEAOF`
 - snapshot persistence with `SAVE` / `BGSAVE` / `LASTSAVE`
+- production hardening controls (max connections, request size, idle timeout, maxmemory guard)
 - metrics endpoint + structured logging + graceful shutdown
+- extra compatibility commands (`ACL WHOAMI|LIST`, `MODULE LIST`, extended `CLIENT` subcommands)
 - benchmark scripts (single and concurrent)
 
 ## next
 
 - tighten Redis error text parity in edge cases
-- expand `CLIENT` compatibility only when needed by real clients
 - keep tuning throughput and lock contention
 - add more restart/recovery stress tests
 

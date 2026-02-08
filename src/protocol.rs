@@ -1,5 +1,12 @@
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 
+#[derive(Clone, Copy)]
+pub struct ReadLimits {
+    pub max_bulk_bytes: usize,
+    pub max_array_len: usize,
+    pub max_line_bytes: usize,
+}
+
 #[derive(Debug, Clone)]
 pub enum RespValue {
     Simple(String),
@@ -10,7 +17,26 @@ pub enum RespValue {
     Map(Vec<(RespValue, RespValue)>),
 }
 
+#[allow(dead_code)]
 pub async fn read_frame<R>(reader: &mut R) -> Result<Option<RespValue>, Box<dyn std::error::Error>>
+where
+    R: AsyncBufRead + AsyncReadExt + Unpin,
+{
+    read_frame_with_limits(
+        reader,
+        ReadLimits {
+            max_bulk_bytes: 8 * 1024 * 1024,
+            max_array_len: 1024,
+            max_line_bytes: 4096,
+        },
+    )
+    .await
+}
+
+pub async fn read_frame_with_limits<R>(
+    reader: &mut R,
+    limits: ReadLimits,
+) -> Result<Option<RespValue>, Box<dyn std::error::Error>>
 where
     R: AsyncBufRead + AsyncReadExt + Unpin,
 {
@@ -23,24 +49,34 @@ where
 
     let frame = match first[0] {
         b'*' => {
-            let count = read_len(reader).await?;
+            let count = read_len(reader, limits.max_line_bytes).await?;
+            if count > limits.max_array_len {
+                return Err("array length exceeds server limit".into());
+            }
             let mut values = Vec::with_capacity(count);
             for _ in 0..count {
                 let mut prefix = [0_u8; 1];
                 reader.read_exact(&mut prefix).await?;
                 match prefix[0] {
                     b'$' => {
-                        let len = read_signed_len(reader).await?;
+                        let len = read_signed_len(reader, limits.max_line_bytes).await?;
                         if len < 0 {
                             values.push(RespValue::Bulk(None));
                         } else {
+                            if len as usize > limits.max_bulk_bytes {
+                                return Err("bulk string exceeds server limit".into());
+                            }
                             let bulk = read_bulk(reader, len as usize).await?;
                             values.push(RespValue::Bulk(Some(bulk)));
                         }
                     }
-                    b'+' => values.push(RespValue::Simple(read_line(reader).await?)),
+                    b'+' => values.push(RespValue::Simple(
+                        read_line(reader, limits.max_line_bytes).await?,
+                    )),
                     b':' => {
-                        let n = read_line(reader).await?.parse::<i64>()?;
+                        let n = read_line(reader, limits.max_line_bytes)
+                            .await?
+                            .parse::<i64>()?;
                         values.push(RespValue::Integer(n));
                     }
                     _ => return Err("unsupported RESP array element".into()),
@@ -48,16 +84,23 @@ where
             }
             RespValue::Array(values)
         }
-        b'+' => RespValue::Simple(read_line(reader).await?),
+        b'+' => RespValue::Simple(read_line(reader, limits.max_line_bytes).await?),
         b'$' => {
-            let len = read_signed_len(reader).await?;
+            let len = read_signed_len(reader, limits.max_line_bytes).await?;
             if len < 0 {
                 RespValue::Bulk(None)
             } else {
+                if len as usize > limits.max_bulk_bytes {
+                    return Err("bulk string exceeds server limit".into());
+                }
                 RespValue::Bulk(Some(read_bulk(reader, len as usize).await?))
             }
         }
-        b':' => RespValue::Integer(read_line(reader).await?.parse::<i64>()?),
+        b':' => RespValue::Integer(
+            read_line(reader, limits.max_line_bytes)
+                .await?
+                .parse::<i64>()?,
+        ),
         _ => return Err("unsupported RESP type".into()),
     };
 
@@ -132,12 +175,18 @@ pub fn frame_to_args(frame: RespValue) -> Result<Vec<Vec<u8>>, String> {
     }
 }
 
-async fn read_line<R>(reader: &mut R) -> Result<String, Box<dyn std::error::Error>>
+async fn read_line<R>(
+    reader: &mut R,
+    max_line_bytes: usize,
+) -> Result<String, Box<dyn std::error::Error>>
 where
     R: AsyncBufRead + Unpin,
 {
     let mut line = Vec::new();
     reader.read_until(b'\n', &mut line).await?;
+    if line.len() > max_line_bytes {
+        return Err("line length exceeds server limit".into());
+    }
     if line.len() < 2 || line[line.len() - 2] != b'\r' {
         return Err("invalid RESP line ending".into());
     }
@@ -145,18 +194,24 @@ where
     Ok(String::from_utf8(line)?)
 }
 
-async fn read_len<R>(reader: &mut R) -> Result<usize, Box<dyn std::error::Error>>
+async fn read_len<R>(
+    reader: &mut R,
+    max_line_bytes: usize,
+) -> Result<usize, Box<dyn std::error::Error>>
 where
     R: AsyncBufRead + Unpin,
 {
-    Ok(read_line(reader).await?.parse::<usize>()?)
+    Ok(read_line(reader, max_line_bytes).await?.parse::<usize>()?)
 }
 
-async fn read_signed_len<R>(reader: &mut R) -> Result<i64, Box<dyn std::error::Error>>
+async fn read_signed_len<R>(
+    reader: &mut R,
+    max_line_bytes: usize,
+) -> Result<i64, Box<dyn std::error::Error>>
 where
     R: AsyncBufRead + Unpin,
 {
-    Ok(read_line(reader).await?.parse::<i64>()?)
+    Ok(read_line(reader, max_line_bytes).await?.parse::<i64>()?)
 }
 
 async fn read_bulk<R>(reader: &mut R, len: usize) -> Result<Vec<u8>, Box<dyn std::error::Error>>

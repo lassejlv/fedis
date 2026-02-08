@@ -35,6 +35,8 @@ docker run --rm -p 6379:6379 fedis
 - `FEDIS_PASSWORD`, `FEDIS_USERNAME`, `FEDIS_USERS`
 - `FEDIS_DATA_PATH`, `FEDIS_AOF_PATH`, `FEDIS_AOF_FSYNC=always|everysec|no`
 - `FEDIS_SNAPSHOT_PATH`, `FEDIS_SNAPSHOT_INTERVAL_SEC`
+- `FEDIS_MAX_CONNECTIONS`, `FEDIS_MAX_REQUEST_BYTES`, `FEDIS_IDLE_TIMEOUT_SEC`
+- `FEDIS_MAXMEMORY_BYTES`
 - `FEDIS_METRICS_ADDR` (Prometheus-style text endpoint)
 - `FEDIS_CONFIG` (`KEY=VALUE` file)
 - `FEDIS_LOG=info|debug|warn|error`
@@ -44,13 +46,14 @@ docker run --rm -p 6379:6379 fedis
 - Strings: `GET`, `SET`, `MGET`, `MSET`, `INCR`, `DECR`, `APPEND`, `GETRANGE`, `SETRANGE`
 - JSON v1: `JSON.SET`, `JSON.GET`, `JSON.DEL`, `JSON.TYPE` (root path only)
 - Keyspace/expiry: `DEL`, `UNLINK`, `EXISTS`, `KEYS`, `SCAN`, `EXPIRE`, `TTL`, `PERSIST`
-- Server: `INFO`, `PING`, `ECHO`, `BGREWRITEAOF`, `BGSAVE`, `SAVE`, `LASTSAVE`
+- Server: `INFO`, `PING`, `ECHO`, `BGREWRITEAOF`, `BGSAVE`, `SAVE`, `LASTSAVE`, `ACL`, `MODULE`
 
 ## Notes
 
 - DB `0` only
 - RESP2 primary, RESP3 map response for `HELLO 3`
 - Persistence: AOF + optional snapshots
+- Hardening knobs: connection limit, request size limit, idle timeout, optional maxmemory guard
 
 ## Benchmarks
 
@@ -62,3 +65,5 @@ python3 benchmarks/check_regression.py
 ```
 
 See `ROADMAP.md` for compatibility tracking.
+
+Deployment guide: `DEPLOY.md`.

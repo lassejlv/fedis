@@ -15,6 +15,10 @@ pub struct Config {
     pub aof_fsync: AofFsync,
     pub snapshot_path: Option<PathBuf>,
     pub snapshot_interval_sec: Option<u64>,
+    pub max_connections: usize,
+    pub max_request_bytes: usize,
+    pub idle_timeout_sec: u64,
+    pub max_memory_bytes: Option<u64>,
     pub metrics_addr: Option<String>,
     pub non_redis_mode: bool,
     pub debug_response_ids: bool,
@@ -131,6 +135,25 @@ impl Config {
             .as_deref()
             .map(parse_u64)
             .transpose()?;
+        let max_connections = setting("FEDIS_MAX_CONNECTIONS")
+            .as_deref()
+            .map(parse_u64)
+            .transpose()?
+            .unwrap_or(1024) as usize;
+        let max_request_bytes = setting("FEDIS_MAX_REQUEST_BYTES")
+            .as_deref()
+            .map(parse_u64)
+            .transpose()?
+            .unwrap_or(8 * 1024 * 1024) as usize;
+        let idle_timeout_sec = setting("FEDIS_IDLE_TIMEOUT_SEC")
+            .as_deref()
+            .map(parse_u64)
+            .transpose()?
+            .unwrap_or(300);
+        let max_memory_bytes = setting("FEDIS_MAXMEMORY_BYTES")
+            .as_deref()
+            .map(parse_u64)
+            .transpose()?;
         let metrics_addr = setting("FEDIS_METRICS_ADDR");
 
         if let Some(path) = &snapshot_path {
@@ -147,6 +170,10 @@ impl Config {
             aof_fsync,
             snapshot_path,
             snapshot_interval_sec,
+            max_connections,
+            max_request_bytes,
+            idle_timeout_sec,
+            max_memory_bytes,
             metrics_addr,
             non_redis_mode,
             debug_response_ids,

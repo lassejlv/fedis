@@ -81,6 +81,16 @@ impl Auth {
             Permissions::Commands(commands) => commands.contains(command),
         }
     }
+
+    pub fn default_user(&self) -> &str {
+        &self.default_user
+    }
+
+    pub fn list_users(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = self.users.keys().map(String::as_str).collect();
+        out.sort_unstable();
+        out
+    }
 }
 
 impl User {

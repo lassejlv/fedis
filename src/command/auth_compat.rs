@@ -229,6 +229,7 @@ impl CommandExecutor {
                 )
             }
             "ID" => (RespValue::Integer(0), SessionAction::Continue),
+            "GETREDIR" => (RespValue::Integer(-1), SessionAction::Continue),
             "LIST" => (
                 RespValue::Bulk(Some(b"id=0 addr=127.0.0.1:0 fd=0 name= age=0 idle=0 flags=N db=0 sub=0 psub=0 ssub=0 multi=-1 qbuf=0 qbuf-free=0 argv-mem=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd=client user=default redir=-1 resp=2".to_vec())),
                 SessionAction::Continue,
@@ -245,7 +246,66 @@ impl CommandExecutor {
                 SessionAction::Continue,
             ),
             "PAUSE" | "UNPAUSE" => (RespValue::Simple("OK".to_string()), SessionAction::Continue),
-            "TRACKING" => (RespValue::Simple("OK".to_string()), SessionAction::Continue),
+            "TRACKING" | "CACHING" | "NO-EVICT" => {
+                (RespValue::Simple("OK".to_string()), SessionAction::Continue)
+            }
+            _ => (
+                RespValue::Error(format!("ERR unknown subcommand '{}'", sub.to_lowercase())),
+                SessionAction::Continue,
+            ),
+        }
+    }
+
+    pub(super) fn acl(
+        &self,
+        args: &[Vec<u8>],
+        session: &SessionAuth,
+    ) -> (RespValue, SessionAction) {
+        if args.len() < 2 {
+            return (
+                RespValue::Error("ERR wrong number of arguments for 'acl' command".to_string()),
+                SessionAction::Continue,
+            );
+        }
+
+        let sub = upper(&args[1]);
+        match sub.as_str() {
+            "WHOAMI" => (
+                RespValue::Bulk(Some(
+                    session
+                        .user
+                        .clone()
+                        .unwrap_or_else(|| self.auth.default_user().to_string())
+                        .into_bytes(),
+                )),
+                SessionAction::Continue,
+            ),
+            "LIST" => {
+                let users = self
+                    .auth
+                    .list_users()
+                    .into_iter()
+                    .map(|u| RespValue::Bulk(Some(format!("user {} on", u).into_bytes())))
+                    .collect();
+                (RespValue::Array(users), SessionAction::Continue)
+            }
+            _ => (
+                RespValue::Error(format!("ERR unknown subcommand '{}'", sub.to_lowercase())),
+                SessionAction::Continue,
+            ),
+        }
+    }
+
+    pub(super) fn module_cmd(&self, args: &[Vec<u8>]) -> (RespValue, SessionAction) {
+        if args.len() < 2 {
+            return (
+                RespValue::Error("ERR wrong number of arguments for 'module' command".to_string()),
+                SessionAction::Continue,
+            );
+        }
+        let sub = upper(&args[1]);
+        match sub.as_str() {
+            "LIST" => (RespValue::Array(Vec::new()), SessionAction::Continue),
             _ => (
                 RespValue::Error(format!("ERR unknown subcommand '{}'", sub.to_lowercase())),
                 SessionAction::Continue,
@@ -551,6 +611,14 @@ fn command_table() -> &'static [CommandSpec] {
             step: 1,
         },
         CommandSpec {
+            name: "ACL",
+            arity: -2,
+            flags: &["admin"],
+            first_key: 0,
+            last_key: 0,
+            step: 0,
+        },
+        CommandSpec {
             name: "AUTH",
             arity: -2,
             flags: &["fast"],
@@ -821,6 +889,14 @@ fn command_table() -> &'static [CommandSpec] {
             first_key: 1,
             last_key: -1,
             step: 2,
+        },
+        CommandSpec {
+            name: "MODULE",
+            arity: -2,
+            flags: &["admin"],
+            first_key: 0,
+            last_key: 0,
+            step: 0,
         },
         CommandSpec {
             name: "OBJECT",
