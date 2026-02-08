@@ -32,6 +32,8 @@ ARG FEDIS_LOG
 ARG FEDIS_NON_REDIS_MODE
 ARG FEDIS_DEBUG_RESPONSE_ID
 
+ENV FEDIS_HOST=0.0.0.0
+
 COPY --from=builder /app/target/release/fedis /usr/local/bin/fedis
 EXPOSE 6379
-CMD ["fedis"]
+CMD ["sh", "-c", "if [ -n \"$PORT\" ] && [ -z \"$FEDIS_PORT\" ]; then export FEDIS_PORT=\"$PORT\"; fi; exec fedis"]
