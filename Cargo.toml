@@ -1,0 +1,10 @@
+[package]
+name = "fedis"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.44.0", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time", "fs"] }
+url = "2.5.4"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
