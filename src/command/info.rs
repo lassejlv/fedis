@@ -23,7 +23,11 @@ impl CommandExecutor {
                 server_section(uptime, &self.listen_addr),
                 clients_section(self.stats.connected_clients()),
                 memory_section(metrics.approx_memory_bytes),
-                stats_section(self.stats.total_connections(), self.stats.total_commands()),
+                stats_section(
+                    self.stats.total_connections(),
+                    self.stats.total_commands(),
+                    self.stats.total_command_usec(),
+                ),
                 commandstats_section(&commandstats),
                 persistence_section(&persistence),
                 keyspace_section(metrics.keys, metrics.expiring_keys),
@@ -34,6 +38,7 @@ impl CommandExecutor {
             "stats" => vec![stats_section(
                 self.stats.total_connections(),
                 self.stats.total_commands(),
+                self.stats.total_command_usec(),
             )],
             "commandstats" => vec![commandstats_section(&commandstats)],
             "persistence" => vec![persistence_section(&persistence)],
@@ -103,10 +108,15 @@ fn memory_section(memory_bytes: usize) -> String {
     )
 }
 
-fn stats_section(total_connections: u64, total_commands: u64) -> String {
+fn stats_section(total_connections: u64, total_commands: u64, total_command_usec: u64) -> String {
+    let usec_per_call = if total_commands == 0 {
+        0.0
+    } else {
+        total_command_usec as f64 / total_commands as f64
+    };
     format!(
-        "# Stats\ntotal_connections_received:{}\ntotal_commands_processed:{}",
-        total_connections, total_commands
+        "# Stats\ntotal_connections_received:{}\ntotal_commands_processed:{}\ntotal_command_usec:{}\ninstantaneous_ops_per_sec:0\nusec_per_call:{:.2}",
+        total_connections, total_commands, total_command_usec, usec_per_call
     )
 }
 
@@ -114,11 +124,19 @@ fn keyspace_section(keys: usize, expiring_keys: usize) -> String {
     format!("# Keyspace\ndb0:keys={},expires={}", keys, expiring_keys)
 }
 
-fn commandstats_section(commandstats: &[(String, u64)]) -> String {
+fn commandstats_section(commandstats: &[(String, u64, u64)]) -> String {
     let mut out = String::from("# Commandstats");
-    for (command, calls) in commandstats {
+    for (command, calls, usec) in commandstats {
+        let usec_per_call = if *calls == 0 {
+            0.0
+        } else {
+            *usec as f64 / *calls as f64
+        };
         out.push('\n');
-        out.push_str(&format!("cmdstat_{}:calls={}", command, calls));
+        out.push_str(&format!(
+            "cmdstat_{}:calls={},usec={},usec_per_call={:.2}",
+            command, calls, usec, usec_per_call
+        ));
     }
     out
 }

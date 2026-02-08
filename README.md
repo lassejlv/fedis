@@ -54,4 +54,4 @@ redis-cli -a secret
 - RESP2 is the primary protocol target.
 - DB index `0` only.
 - AOF rewrite is implemented via `BGREWRITEAOF`.
-- `INFO persistence` and `INFO commandstats` are supported.
+- `INFO persistence` and `INFO commandstats` are supported, including per-command `calls`, `usec`, and `usec_per_call`.

@@ -8,7 +8,14 @@ pub struct ServerStats {
     connected_clients: AtomicUsize,
     total_connections: AtomicU64,
     total_commands: AtomicU64,
-    command_calls: Mutex<HashMap<String, u64>>,
+    total_command_usec: AtomicU64,
+    command_calls: Mutex<HashMap<String, CommandTiming>>,
+}
+
+#[derive(Clone, Copy)]
+struct CommandTiming {
+    calls: u64,
+    usec: u64,
 }
 
 impl ServerStats {
@@ -18,6 +25,7 @@ impl ServerStats {
             connected_clients: AtomicUsize::new(0),
             total_connections: AtomicU64::new(0),
             total_commands: AtomicU64::new(0),
+            total_command_usec: AtomicU64::new(0),
             command_calls: Mutex::new(HashMap::new()),
         }
     }
@@ -31,12 +39,17 @@ impl ServerStats {
         self.connected_clients.fetch_sub(1, Ordering::Relaxed);
     }
 
-    pub fn on_command(&self, command: &str) {
+    pub fn record_command(&self, command: &str, elapsed_usec: u64) {
         self.total_commands.fetch_add(1, Ordering::Relaxed);
+        self.total_command_usec
+            .fetch_add(elapsed_usec, Ordering::Relaxed);
         if let Ok(mut calls) = self.command_calls.lock() {
             let key = command.to_ascii_lowercase();
-            let entry = calls.entry(key).or_insert(0);
-            *entry += 1;
+            let entry = calls
+                .entry(key)
+                .or_insert(CommandTiming { calls: 0, usec: 0 });
+            entry.calls += 1;
+            entry.usec = entry.usec.saturating_add(elapsed_usec);
         }
     }
 
@@ -56,9 +69,16 @@ impl ServerStats {
         self.total_commands.load(Ordering::Relaxed)
     }
 
-    pub fn command_stats_snapshot(&self) -> Vec<(String, u64)> {
+    pub fn total_command_usec(&self) -> u64 {
+        self.total_command_usec.load(Ordering::Relaxed)
+    }
+
+    pub fn command_stats_snapshot(&self) -> Vec<(String, u64, u64)> {
         if let Ok(calls) = self.command_calls.lock() {
-            let mut out: Vec<(String, u64)> = calls.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            let mut out: Vec<(String, u64, u64)> = calls
+                .iter()
+                .map(|(k, v)| (k.clone(), v.calls, v.usec))
+                .collect();
             out.sort_by(|a, b| a.0.cmp(&b.0));
             return out;
         }

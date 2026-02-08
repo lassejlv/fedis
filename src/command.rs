@@ -48,7 +48,6 @@ impl CommandExecutor {
         }
 
         let cmd = upper(&args[0]);
-        self.stats.on_command(&cmd);
         if cmd != "AUTH"
             && cmd != "PING"
             && cmd != "QUIT"
@@ -132,6 +131,10 @@ impl CommandExecutor {
                 SessionAction::Continue,
             ),
         }
+    }
+
+    pub fn record_command_stats(&self, command: &str, elapsed_usec: u64) {
+        self.stats.record_command(command, elapsed_usec);
     }
 }
 

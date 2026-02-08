@@ -119,7 +119,9 @@ async fn handle_client(
                 let arg_count = args.len();
                 let started = Instant::now();
                 let (resp, action) = executor.execute(args, &mut session).await;
-                let elapsed_ms = started.elapsed().as_millis() as u64;
+                let elapsed_usec = started.elapsed().as_micros() as u64;
+                let elapsed_ms = elapsed_usec / 1000;
+                executor.record_command_stats(&command, elapsed_usec);
                 let authed_user = session.user.as_deref().unwrap_or("-");
                 if matches!(resp, RespValue::Error(_)) {
                     warn!(
