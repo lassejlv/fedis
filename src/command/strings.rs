@@ -408,11 +408,19 @@ impl CommandExecutor {
         }
 
         let mut expires_at = None;
+        let mut saw_ex = false;
+        let mut saw_px = false;
         let mut idx = 3;
         while idx < args.len() {
             let token = upper(&args[idx]);
             match token.as_str() {
                 "EX" => {
+                    if saw_ex || saw_px {
+                        return (
+                            RespValue::Error("ERR syntax error".to_string()),
+                            SessionAction::Continue,
+                        );
+                    }
                     if idx + 1 >= args.len() {
                         return (
                             RespValue::Error("ERR syntax error".to_string()),
@@ -427,10 +435,17 @@ impl CommandExecutor {
                             SessionAction::Continue,
                         );
                     };
+                    saw_ex = true;
                     expires_at = Some(now_ms().saturating_add(secs.saturating_mul(1000)));
                     idx += 2;
                 }
                 "PX" => {
+                    if saw_px || saw_ex {
+                        return (
+                            RespValue::Error("ERR syntax error".to_string()),
+                            SessionAction::Continue,
+                        );
+                    }
                     if idx + 1 >= args.len() {
                         return (
                             RespValue::Error("ERR syntax error".to_string()),
@@ -445,6 +460,7 @@ impl CommandExecutor {
                             SessionAction::Continue,
                         );
                     };
+                    saw_px = true;
                     expires_at = Some(now_ms().saturating_add(ms));
                     idx += 2;
                 }

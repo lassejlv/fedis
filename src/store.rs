@@ -1,16 +1,22 @@
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio::sync::RwLock;
+use serde_json::Value as JsonValue;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::persistence::{Aof, LogRecord};
 
+const DEFAULT_SHARDS: usize = 32;
+
 #[derive(Clone)]
 pub struct Store {
-    state: std::sync::Arc<RwLock<HashMap<Vec<u8>, ValueEntry>>>,
+    shards: std::sync::Arc<Vec<RwLock<HashMap<Vec<u8>, ValueEntry>>>>,
+    shard_count: usize,
+    op_lock: std::sync::Arc<Mutex<()>>,
     aof: Aof,
     rewrite_in_progress: std::sync::Arc<AtomicBool>,
     rewrite_count: std::sync::Arc<AtomicU64>,
@@ -76,8 +82,15 @@ impl Store {
         aof: Aof,
         snapshot_path: Option<PathBuf>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut shards = Vec::with_capacity(DEFAULT_SHARDS);
+        for _ in 0..DEFAULT_SHARDS {
+            shards.push(RwLock::new(HashMap::new()));
+        }
+
         let store = Self {
-            state: std::sync::Arc::new(RwLock::new(HashMap::new())),
+            shards: std::sync::Arc::new(shards),
+            shard_count: DEFAULT_SHARDS,
+            op_lock: std::sync::Arc::new(Mutex::new(())),
             aof,
             rewrite_in_progress: std::sync::Arc::new(AtomicBool::new(false)),
             rewrite_count: std::sync::Arc::new(AtomicU64::new(0)),
@@ -94,6 +107,10 @@ impl Store {
         Ok(store)
     }
 
+    fn shard_idx(&self, key: &[u8]) -> usize {
+        shard_index(key, self.shard_count)
+    }
+
     async fn load_snapshot(&self) -> Result<(), Box<dyn std::error::Error>> {
         let Some(path) = &self.snapshot_path else {
             return Ok(());
@@ -103,11 +120,16 @@ impl Store {
         }
 
         let entries = read_snapshot(path)?;
-        let mut state = self.state.write().await;
-        state.clear();
+        for shard in self.shards.iter() {
+            shard.write().await.clear();
+        }
         for (key, value, expires_at) in entries {
             if !is_expired(expires_at) {
-                state.insert(key, ValueEntry { value, expires_at });
+                let idx = self.shard_idx(&key);
+                self.shards[idx]
+                    .write()
+                    .await
+                    .insert(key, ValueEntry { value, expires_at });
             }
         }
         Ok(())
@@ -115,7 +137,6 @@ impl Store {
 
     async fn replay(&self) -> Result<(), Box<dyn std::error::Error>> {
         let records = self.aof.read_all()?;
-        let mut state = self.state.write().await;
         for record in records {
             match record {
                 LogRecord::Set {
@@ -124,19 +145,26 @@ impl Store {
                     expires_at,
                 } => {
                     if !is_expired(expires_at) {
-                        state.insert(key, ValueEntry { value, expires_at });
+                        let idx = self.shard_idx(&key);
+                        self.shards[idx]
+                            .write()
+                            .await
+                            .insert(key, ValueEntry { value, expires_at });
                     }
                 }
                 LogRecord::Del { key } => {
-                    state.remove(&key);
+                    let idx = self.shard_idx(&key);
+                    self.shards[idx].write().await.remove(&key);
                 }
                 LogRecord::Expire { key, expires_at } => {
-                    if let Some(entry) = state.get_mut(&key) {
+                    let idx = self.shard_idx(&key);
+                    if let Some(entry) = self.shards[idx].write().await.get_mut(&key) {
                         entry.expires_at = Some(expires_at);
                     }
                 }
                 LogRecord::Persist { key } => {
-                    if let Some(entry) = state.get_mut(&key) {
+                    let idx = self.shard_idx(&key);
+                    if let Some(entry) = self.shards[idx].write().await.get_mut(&key) {
                         entry.expires_at = None;
                     }
                 }
@@ -146,9 +174,10 @@ impl Store {
     }
 
     pub async fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let idx = self.shard_idx(key);
         {
-            let state = self.state.read().await;
-            if let Some(entry) = state.get(key) {
+            let shard = self.shards[idx].read().await;
+            if let Some(entry) = shard.get(key) {
                 if !is_expired(entry.expires_at) {
                     return Some(entry.value.clone());
                 }
@@ -157,10 +186,10 @@ impl Store {
             }
         }
 
-        let mut state = self.state.write().await;
-        if let Some(entry) = state.get(key) {
+        let mut shard = self.shards[idx].write().await;
+        if let Some(entry) = shard.get(key) {
             if is_expired(entry.expires_at) {
-                state.remove(key);
+                shard.remove(key);
                 return None;
             }
             return Some(entry.value.clone());
@@ -169,20 +198,21 @@ impl Store {
     }
 
     pub async fn getdel(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
-        let mut state = self.state.write().await;
-        let value = if let Some(entry) = state.get(key) {
+        let idx = self.shard_idx(key);
+        let mut shard = self.shards[idx].write().await;
+        let value = if let Some(entry) = shard.get(key) {
             if is_expired(entry.expires_at) {
-                state.remove(key);
+                shard.remove(key);
                 None
             } else {
                 let value = entry.value.clone();
-                state.remove(key);
+                shard.remove(key);
                 Some(value)
             }
         } else {
             None
         };
-        drop(state);
+        drop(shard);
 
         if value.is_some() {
             self.aof
@@ -200,8 +230,20 @@ impl Store {
         expires_at: Option<u64>,
         condition: SetCondition,
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        let mut state = self.state.write().await;
-        let exists = state.get(&key).is_some_and(|e| !is_expired(e.expires_at));
+        let idx = self.shard_idx(&key);
+        let mut shard = self.shards[idx].write().await;
+
+        let exists = if let Some(entry) = shard.get(&key) {
+            if is_expired(entry.expires_at) {
+                shard.remove(&key);
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+
         let allowed = match condition {
             SetCondition::None => true,
             SetCondition::Nx => !exists,
@@ -212,14 +254,14 @@ impl Store {
             return Ok(false);
         }
 
-        state.insert(
+        shard.insert(
             key.clone(),
             ValueEntry {
                 value: value.clone(),
                 expires_at,
             },
         );
-        drop(state);
+        drop(shard);
 
         self.aof
             .append(LogRecord::Set {
@@ -235,12 +277,14 @@ impl Store {
         &self,
         pairs: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        let mut state = self.state.write().await;
+        let _guard = self.op_lock.lock().await;
 
         for (key, _) in pairs {
-            if let Some(entry) = state.get(key) {
+            let idx = self.shard_idx(key);
+            let mut shard = self.shards[idx].write().await;
+            if let Some(entry) = shard.get(key) {
                 if is_expired(entry.expires_at) {
-                    state.remove(key);
+                    shard.remove(key);
                 } else {
                     return Ok(false);
                 }
@@ -248,7 +292,8 @@ impl Store {
         }
 
         for (key, value) in pairs {
-            state.insert(
+            let idx = self.shard_idx(key);
+            self.shards[idx].write().await.insert(
                 key.clone(),
                 ValueEntry {
                     value: value.clone(),
@@ -256,7 +301,6 @@ impl Store {
                 },
             );
         }
-        drop(state);
 
         for (key, value) in pairs {
             self.aof
@@ -273,13 +317,12 @@ impl Store {
 
     pub async fn del(&self, keys: &[Vec<u8>]) -> Result<i64, Box<dyn std::error::Error>> {
         let mut removed = 0_i64;
-        let mut state = self.state.write().await;
         for key in keys {
-            if state.remove(key).is_some() {
+            let idx = self.shard_idx(key);
+            if self.shards[idx].write().await.remove(key).is_some() {
                 removed += 1;
             }
         }
-        drop(state);
 
         for key in keys {
             self.aof.append(LogRecord::Del { key: key.clone() }).await?;
@@ -290,11 +333,23 @@ impl Store {
 
     pub async fn exists(&self, keys: &[Vec<u8>]) -> i64 {
         let mut count = 0_i64;
-        let mut state = self.state.write().await;
         for key in keys {
-            if let Some(entry) = state.get(key) {
+            let idx = self.shard_idx(key);
+            {
+                let shard = self.shards[idx].read().await;
+                if let Some(entry) = shard.get(key) {
+                    if !is_expired(entry.expires_at) {
+                        count += 1;
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+            let mut shard = self.shards[idx].write().await;
+            if let Some(entry) = shard.get(key) {
                 if is_expired(entry.expires_at) {
-                    state.remove(key);
+                    shard.remove(key);
                 } else {
                     count += 1;
                 }
@@ -335,14 +390,15 @@ impl Store {
         key: &[u8],
         expires_at: u64,
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        let mut state = self.state.write().await;
-        if let Some(entry) = state.get_mut(key) {
+        let idx = self.shard_idx(key);
+        let mut shard = self.shards[idx].write().await;
+        if let Some(entry) = shard.get_mut(key) {
             if is_expired(entry.expires_at) {
-                state.remove(key);
+                shard.remove(key);
                 return Ok(false);
             }
             entry.expires_at = Some(expires_at);
-            drop(state);
+            drop(shard);
             self.aof
                 .append(LogRecord::Expire {
                     key: key.to_vec(),
@@ -355,17 +411,18 @@ impl Store {
     }
 
     pub async fn persist(&self, key: &[u8]) -> Result<bool, Box<dyn std::error::Error>> {
-        let mut state = self.state.write().await;
-        if let Some(entry) = state.get_mut(key) {
+        let idx = self.shard_idx(key);
+        let mut shard = self.shards[idx].write().await;
+        if let Some(entry) = shard.get_mut(key) {
             if is_expired(entry.expires_at) {
-                state.remove(key);
+                shard.remove(key);
                 return Ok(false);
             }
             if entry.expires_at.is_none() {
                 return Ok(false);
             }
             entry.expires_at = None;
-            drop(state);
+            drop(shard);
             self.aof
                 .append(LogRecord::Persist { key: key.to_vec() })
                 .await?;
@@ -375,16 +432,17 @@ impl Store {
     }
 
     pub async fn ttl(&self, key: &[u8]) -> i64 {
-        let mut state = self.state.write().await;
-        if let Some(entry) = state.get(key) {
+        let idx = self.shard_idx(key);
+        let mut shard = self.shards[idx].write().await;
+        if let Some(entry) = shard.get(key) {
             if is_expired(entry.expires_at) {
-                state.remove(key);
+                shard.remove(key);
                 return -2;
             }
             if let Some(exp) = entry.expires_at {
                 let now = now_ms();
                 if exp <= now {
-                    state.remove(key);
+                    shard.remove(key);
                     return -2;
                 }
                 return ((exp - now) / 1000) as i64;
@@ -395,16 +453,17 @@ impl Store {
     }
 
     pub async fn pttl(&self, key: &[u8]) -> i64 {
-        let mut state = self.state.write().await;
-        if let Some(entry) = state.get(key) {
+        let idx = self.shard_idx(key);
+        let mut shard = self.shards[idx].write().await;
+        if let Some(entry) = shard.get(key) {
             if is_expired(entry.expires_at) {
-                state.remove(key);
+                shard.remove(key);
                 return -2;
             }
             if let Some(exp) = entry.expires_at {
                 let now = now_ms();
                 if exp <= now {
-                    state.remove(key);
+                    shard.remove(key);
                     return -2;
                 }
                 return (exp - now) as i64;
@@ -415,10 +474,11 @@ impl Store {
     }
 
     pub async fn incr_by(&self, key: &[u8], amount: i64) -> Result<i64, IncrByError> {
-        let mut state = self.state.write().await;
-        let (current, expires_at) = if let Some(entry) = state.get(key) {
+        let idx = self.shard_idx(key);
+        let mut shard = self.shards[idx].write().await;
+        let (current, expires_at) = if let Some(entry) = shard.get(key) {
             if is_expired(entry.expires_at) {
-                state.remove(key);
+                shard.remove(key);
                 (0_i64, None)
             } else {
                 let parsed = std::str::from_utf8(&entry.value)
@@ -433,14 +493,14 @@ impl Store {
 
         let next = current.checked_add(amount).ok_or(IncrByError::OutOfRange)?;
         let next_bytes = next.to_string().into_bytes();
-        state.insert(
+        shard.insert(
             key.to_vec(),
             ValueEntry {
                 value: next_bytes.clone(),
                 expires_at,
             },
         );
-        drop(state);
+        drop(shard);
 
         self.aof
             .append(LogRecord::Set {
@@ -455,45 +515,56 @@ impl Store {
     }
 
     pub async fn metrics(&self) -> StoreMetrics {
-        let state = self.state.read().await;
         let mut expiring = 0_usize;
         let mut memory = 0_usize;
+        let mut keys = 0_usize;
 
-        for (key, entry) in state.iter() {
-            if entry.expires_at.is_some() {
-                expiring += 1;
+        for shard in self.shards.iter() {
+            let map = shard.read().await;
+            keys += map.len();
+            for (key, entry) in map.iter() {
+                if entry.expires_at.is_some() {
+                    expiring += 1;
+                }
+                memory = memory
+                    .saturating_add(key.len())
+                    .saturating_add(entry.value.len())
+                    .saturating_add(std::mem::size_of::<ValueEntry>());
             }
-            memory = memory
-                .saturating_add(key.len())
-                .saturating_add(entry.value.len())
-                .saturating_add(std::mem::size_of::<ValueEntry>());
         }
 
         StoreMetrics {
-            keys: state.len(),
+            keys,
             expiring_keys: expiring,
             approx_memory_bytes: memory,
         }
     }
 
     pub async fn cleanup_expired(&self) {
-        let mut state = self.state.write().await;
         let now = now_ms();
-        state.retain(|_, v| v.expires_at.is_none_or(|exp| exp > now));
+        for shard in self.shards.iter() {
+            shard
+                .write()
+                .await
+                .retain(|_, v| v.expires_at.is_none_or(|exp| exp > now));
+        }
     }
 
     pub async fn dbsize(&self) -> i64 {
-        let mut state = self.state.write().await;
-        let now = now_ms();
-        state.retain(|_, v| v.expires_at.is_none_or(|exp| exp > now));
-        state.len() as i64
+        self.cleanup_expired().await;
+        let mut total = 0_i64;
+        for shard in self.shards.iter() {
+            total += shard.read().await.len() as i64;
+        }
+        total
     }
 
     pub async fn key_type(&self, key: &[u8]) -> &'static str {
-        let mut state = self.state.write().await;
-        if let Some(entry) = state.get(key) {
+        let idx = self.shard_idx(key);
+        let mut shard = self.shards[idx].write().await;
+        if let Some(entry) = shard.get(key) {
             if is_expired(entry.expires_at) {
-                state.remove(key);
+                shard.remove(key);
                 return "none";
             }
             return "string";
@@ -502,10 +573,11 @@ impl Store {
     }
 
     pub async fn memory_usage(&self, key: &[u8]) -> Option<i64> {
-        let mut state = self.state.write().await;
-        if let Some(entry) = state.get(key) {
+        let idx = self.shard_idx(key);
+        let mut shard = self.shards[idx].write().await;
+        if let Some(entry) = shard.get(key) {
             if is_expired(entry.expires_at) {
-                state.remove(key);
+                shard.remove(key);
                 return None;
             }
             let bytes = key
@@ -518,10 +590,11 @@ impl Store {
     }
 
     pub async fn object_encoding(&self, key: &[u8]) -> Option<&'static str> {
-        let mut state = self.state.write().await;
-        if let Some(entry) = state.get(key) {
+        let idx = self.shard_idx(key);
+        let mut shard = self.shards[idx].write().await;
+        if let Some(entry) = shard.get(key) {
             if is_expired(entry.expires_at) {
-                state.remove(key);
+                shard.remove(key);
                 return None;
             }
             return Some("raw");
@@ -530,10 +603,11 @@ impl Store {
     }
 
     pub async fn strlen(&self, key: &[u8]) -> i64 {
-        let mut state = self.state.write().await;
-        if let Some(entry) = state.get(key) {
+        let idx = self.shard_idx(key);
+        let mut shard = self.shards[idx].write().await;
+        if let Some(entry) = shard.get(key) {
             if is_expired(entry.expires_at) {
-                state.remove(key);
+                shard.remove(key);
                 return 0;
             }
             return entry.value.len() as i64;
@@ -546,10 +620,11 @@ impl Store {
         key: &[u8],
         suffix: &[u8],
     ) -> Result<i64, Box<dyn std::error::Error>> {
-        let mut state = self.state.write().await;
-        let (mut value, expires_at) = if let Some(entry) = state.get(key) {
+        let idx = self.shard_idx(key);
+        let mut shard = self.shards[idx].write().await;
+        let (mut value, expires_at) = if let Some(entry) = shard.get(key) {
             if is_expired(entry.expires_at) {
-                state.remove(key);
+                shard.remove(key);
                 (Vec::new(), None)
             } else {
                 (entry.value.clone(), entry.expires_at)
@@ -560,14 +635,14 @@ impl Store {
 
         value.extend_from_slice(suffix);
         let new_len = value.len() as i64;
-        state.insert(
+        shard.insert(
             key.to_vec(),
             ValueEntry {
                 value: value.clone(),
                 expires_at,
             },
         );
-        drop(state);
+        drop(shard);
 
         self.aof
             .append(LogRecord::Set {
@@ -581,13 +656,14 @@ impl Store {
     }
 
     pub async fn getrange(&self, key: &[u8], start: i64, end: i64) -> Vec<u8> {
-        let mut state = self.state.write().await;
-        let Some(entry) = state.get(key) else {
+        let idx = self.shard_idx(key);
+        let mut shard = self.shards[idx].write().await;
+        let Some(entry) = shard.get(key) else {
             return Vec::new();
         };
 
         if is_expired(entry.expires_at) {
-            state.remove(key);
+            shard.remove(key);
             return Vec::new();
         }
 
@@ -600,10 +676,11 @@ impl Store {
         offset: usize,
         value: &[u8],
     ) -> Result<i64, Box<dyn std::error::Error>> {
-        let mut state = self.state.write().await;
-        let (mut current, expires_at) = if let Some(entry) = state.get(key) {
+        let idx = self.shard_idx(key);
+        let mut shard = self.shards[idx].write().await;
+        let (mut current, expires_at) = if let Some(entry) = shard.get(key) {
             if is_expired(entry.expires_at) {
-                state.remove(key);
+                shard.remove(key);
                 (Vec::new(), None)
             } else {
                 (entry.value.clone(), entry.expires_at)
@@ -621,14 +698,14 @@ impl Store {
         current[offset..offset + value.len()].copy_from_slice(value);
         let new_len = current.len() as i64;
 
-        state.insert(
+        shard.insert(
             key.to_vec(),
             ValueEntry {
                 value: current.clone(),
                 expires_at,
             },
         );
-        drop(state);
+        drop(shard);
 
         self.aof
             .append(LogRecord::Set {
@@ -646,10 +723,11 @@ impl Store {
         key: Vec<u8>,
         value: Vec<u8>,
     ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
-        let mut state = self.state.write().await;
-        let previous = if let Some(entry) = state.get(&key) {
+        let idx = self.shard_idx(&key);
+        let mut shard = self.shards[idx].write().await;
+        let previous = if let Some(entry) = shard.get(&key) {
             if is_expired(entry.expires_at) {
-                state.remove(&key);
+                shard.remove(&key);
                 None
             } else {
                 Some(entry.value.clone())
@@ -658,14 +736,14 @@ impl Store {
             None
         };
 
-        state.insert(
+        shard.insert(
             key.clone(),
             ValueEntry {
                 value: value.clone(),
                 expires_at: None,
             },
         );
-        drop(state);
+        drop(shard);
 
         self.aof
             .append(LogRecord::Set {
@@ -683,13 +761,14 @@ impl Store {
         key: &[u8],
         mode: GetExMode,
     ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
-        let mut state = self.state.write().await;
-        let Some(entry) = state.get_mut(key) else {
+        let idx = self.shard_idx(key);
+        let mut shard = self.shards[idx].write().await;
+        let Some(entry) = shard.get_mut(key) else {
             return Ok(None);
         };
 
         if is_expired(entry.expires_at) {
-            state.remove(key);
+            shard.remove(key);
             return Ok(None);
         }
 
@@ -719,7 +798,7 @@ impl Store {
                 log_record = Some(LogRecord::Persist { key: key_owned });
             }
         }
-        drop(state);
+        drop(shard);
 
         if let Some(record) = log_record {
             self.aof.append(record).await?;
@@ -729,29 +808,25 @@ impl Store {
     }
 
     pub async fn keys(&self, pattern: &[u8]) -> Vec<Vec<u8>> {
-        let mut state = self.state.write().await;
-        let now = now_ms();
-        state.retain(|_, v| v.expires_at.is_none_or(|exp| exp > now));
+        self.cleanup_expired().await;
 
-        let mut out: Vec<Vec<u8>> = state
-            .keys()
-            .filter(|k| glob_match(pattern, k))
-            .cloned()
-            .collect();
+        let mut out = Vec::new();
+        for shard in self.shards.iter() {
+            let map = shard.read().await;
+            out.extend(map.keys().filter(|k| glob_match(pattern, k)).cloned());
+        }
         out.sort();
         out
     }
 
     pub async fn scan(&self, cursor: u64, pattern: &[u8], count: usize) -> ScanResult {
-        let mut state = self.state.write().await;
-        let now = now_ms();
-        state.retain(|_, v| v.expires_at.is_none_or(|exp| exp > now));
+        self.cleanup_expired().await;
 
-        let mut keys: Vec<Vec<u8>> = state
-            .keys()
-            .filter(|k| glob_match(pattern, k))
-            .cloned()
-            .collect();
+        let mut keys = Vec::new();
+        for shard in self.shards.iter() {
+            let map = shard.read().await;
+            keys.extend(map.keys().filter(|k| glob_match(pattern, k)).cloned());
+        }
         keys.sort();
 
         let start = cursor as usize;
@@ -798,13 +873,16 @@ impl Store {
 
     async fn rewrite_aof(&self) -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = {
-            let mut state = self.state.write().await;
-            let now = now_ms();
-            state.retain(|_, v| v.expires_at.is_none_or(|exp| exp > now));
-            state
-                .iter()
-                .map(|(key, entry)| (key.clone(), entry.value.clone(), entry.expires_at))
-                .collect::<Vec<_>>()
+            self.cleanup_expired().await;
+            let mut entries = Vec::new();
+            for shard in self.shards.iter() {
+                let map = shard.read().await;
+                entries.extend(
+                    map.iter()
+                        .map(|(key, entry)| (key.clone(), entry.value.clone(), entry.expires_at)),
+                );
+            }
+            entries
         };
 
         self.aof.rewrite_from_snapshot(snapshot).await
@@ -829,15 +907,15 @@ impl Store {
             return Err("snapshot path is not configured".into());
         };
 
-        let entries = {
-            let mut state = self.state.write().await;
-            let now = now_ms();
-            state.retain(|_, v| v.expires_at.is_none_or(|exp| exp > now));
-            state
-                .iter()
-                .map(|(k, v)| (k.clone(), v.value.clone(), v.expires_at))
-                .collect::<Vec<_>>()
-        };
+        self.cleanup_expired().await;
+        let mut entries = Vec::new();
+        for shard in self.shards.iter() {
+            let map = shard.read().await;
+            entries.extend(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), v.value.clone(), v.expires_at)),
+            );
+        }
 
         write_snapshot(path, entries)?;
         self.snapshot_count.fetch_add(1, Ordering::SeqCst);
@@ -868,6 +946,49 @@ impl Store {
         });
         true
     }
+
+    pub async fn json_set_root(
+        &self,
+        key: Vec<u8>,
+        json: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let parsed: JsonValue = serde_json::from_slice(json)?;
+        let encoded = serde_json::to_vec(&parsed)?;
+        let _ = self.set(key, encoded, None, SetCondition::None).await?;
+        Ok(())
+    }
+
+    pub async fn json_get_root(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let value = self.get(key).await?;
+        if serde_json::from_slice::<JsonValue>(&value).is_ok() {
+            return Some(value);
+        }
+        None
+    }
+
+    pub async fn json_del_root(&self, key: &[u8]) -> Result<i64, Box<dyn std::error::Error>> {
+        self.del(&[key.to_vec()]).await
+    }
+
+    pub async fn json_type_root(&self, key: &[u8]) -> Option<&'static str> {
+        let value = self.get(key).await?;
+        let parsed: JsonValue = serde_json::from_slice(&value).ok()?;
+        Some(match parsed {
+            JsonValue::Null => "null",
+            JsonValue::Bool(_) => "boolean",
+            JsonValue::Number(ref n) if n.is_i64() || n.is_u64() => "integer",
+            JsonValue::Number(_) => "number",
+            JsonValue::String(_) => "string",
+            JsonValue::Array(_) => "array",
+            JsonValue::Object(_) => "object",
+        })
+    }
+}
+
+fn shard_index(key: &[u8], count: usize) -> usize {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    (hasher.finish() as usize) % count
 }
 
 fn now_ms() -> u64 {

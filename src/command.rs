@@ -1,6 +1,7 @@
 mod auth_compat;
 mod expiry;
 mod info;
+mod json;
 mod keyspace;
 mod strings;
 
@@ -91,6 +92,10 @@ impl CommandExecutor {
             "LASTSAVE" => self.lastsave(&args),
             "BGREWRITEAOF" => self.bgrewriteaof(&args).await,
             "GET" => self.get(&args).await,
+            "JSON.SET" => self.json_set(&args).await,
+            "JSON.GET" => self.json_get(&args).await,
+            "JSON.DEL" => self.json_del(&args).await,
+            "JSON.TYPE" => self.json_type(&args).await,
             "GETDEL" => self.getdel(&args).await,
             "GETEX" => self.getex(&args).await,
             "GETSET" => self.getset(&args).await,

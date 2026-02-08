@@ -54,6 +54,14 @@ fn expect_error(value: RespValue) -> String {
     }
 }
 
+fn expect_simple(value: RespValue) -> String {
+    if let RespValue::Simple(v) = value {
+        v
+    } else {
+        panic!("expected simple response");
+    }
+}
+
 #[tokio::test]
 async fn setnx_sets_only_when_missing() {
     let (executor, mut session, path) = make_executor().await;
@@ -174,6 +182,24 @@ async fn set_rejects_conflicting_nx_xx_options() {
 }
 
 #[tokio::test]
+async fn update_rejects_conflicting_ex_px_options() {
+    let (executor, mut session, path) = make_executor().await;
+
+    let _ = run(&executor, &mut session, &["SET", "a", "1"]).await;
+    let err = expect_error(
+        run(
+            &executor,
+            &mut session,
+            &["UPDATE", "a", "2", "EX", "1", "PX", "1"],
+        )
+        .await,
+    );
+    assert_eq!(err, "ERR syntax error");
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
 async fn getrange_and_setrange_work_with_offsets() {
     let (executor, mut session, path) = make_executor().await;
 
@@ -204,6 +230,47 @@ async fn setrange_zero_fills_for_new_keys() {
     );
     let value = expect_bulk(run(&executor, &mut session, &["GET", "x"]).await).unwrap();
     assert_eq!(value, vec![0, 0, 0, b'a', b'b']);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn json_set_get_type_del_root_path() {
+    let (executor, mut session, path) = make_executor().await;
+
+    assert_eq!(
+        expect_simple(
+            run(
+                &executor,
+                &mut session,
+                &["JSON.SET", "j", "$", "{\"a\":1}"]
+            )
+            .await
+        ),
+        "OK"
+    );
+    assert_eq!(
+        expect_bulk(run(&executor, &mut session, &["JSON.GET", "j"]).await),
+        Some(b"{\"a\":1}".to_vec())
+    );
+    assert_eq!(
+        expect_bulk(run(&executor, &mut session, &["JSON.TYPE", "j"]).await),
+        Some(b"object".to_vec())
+    );
+    assert_eq!(
+        expect_int(run(&executor, &mut session, &["JSON.DEL", "j"]).await),
+        1
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn json_rejects_non_root_path() {
+    let (executor, mut session, path) = make_executor().await;
+
+    let err = expect_error(run(&executor, &mut session, &["JSON.GET", "j", "$.a"]).await);
+    assert_eq!(err, "ERR only root path is supported");
 
     let _ = std::fs::remove_file(path);
 }

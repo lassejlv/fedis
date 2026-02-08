@@ -4,6 +4,7 @@ import os
 import socket
 import subprocess
 import time
+from statistics import median
 
 
 def encode(parts):
@@ -55,12 +56,20 @@ def main():
         sock.sendall(encode(["SET", "bench:key", "0"]))
         recv_one(sock)
 
-        set_ops = run_loop(sock, encode(["SET", "bench:key", "123"]), thresholds["duration_sec"])
-        get_ops = run_loop(sock, encode(["GET", "bench:key"]), thresholds["duration_sec"])
+        set_payload = encode(["SET", "bench:key", "123"])
+        get_payload = encode(["GET", "bench:key"])
+
+        run_loop(sock, set_payload, 0.4)
+        run_loop(sock, get_payload, 0.4)
+
+        set_samples = [run_loop(sock, set_payload, thresholds["duration_sec"]) for _ in range(3)]
+        get_samples = [run_loop(sock, get_payload, thresholds["duration_sec"]) for _ in range(3)]
+        set_ops = median(set_samples)
+        get_ops = median(get_samples)
         sock.close()
 
-        print(f"SET ops/sec: {set_ops:.0f}")
-        print(f"GET ops/sec: {get_ops:.0f}")
+        print(f"SET ops/sec (median): {set_ops:.0f}")
+        print(f"GET ops/sec (median): {get_ops:.0f}")
 
         failures = []
         if set_ops < thresholds["set_ops_per_sec_min"]:
