@@ -1,0 +1,75 @@
+name: Publish Docker Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag to publish (for manual runs)"
+        required: true
+        type: string
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    env:
+      RAILPACK_VERSION: "0.2.3"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Install Railpack
+        run: |
+          curl -sSL https://railpack.com/install.sh | RAILPACK_VERSION=${RAILPACK_VERSION} sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve image metadata
+        id: meta
+        run: |
+          release_tag="${{ github.event.release.tag_name }}"
+          if [ -z "$release_tag" ]; then
+            release_tag="${{ github.event.inputs.release_tag }}"
+          fi
+
+          if [ -z "$release_tag" ]; then
+            echo "Release tag is missing"
+            exit 1
+          fi
+
+          image_repo="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/fedis"
+          echo "image_repo=${image_repo}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate Railpack plan
+        run: railpack prepare . --plan-out ./railpack-plan.json --info-out ./railpack-info.json
+
+      - name: Build and push image
+        run: |
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg BUILDKIT_SYNTAX="ghcr.io/railwayapp/railpack-frontend:v${RAILPACK_VERSION}" \
+            --build-arg github-token="${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}" \
+            -f ./railpack-plan.json \
+            -t "${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.release_tag }}" \
+            -t "${{ steps.meta.outputs.image_repo }}:latest" \
+            --push \
+            .
