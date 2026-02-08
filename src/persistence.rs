@@ -3,6 +3,7 @@ use std::path::Path;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 
 const MAGIC: &[u8] = b"FDLOG1";
 const OP_SET: u8 = 1;
@@ -22,6 +23,7 @@ pub struct Aof {
     inner: std::sync::Arc<Mutex<tokio::fs::File>>,
     path: std::path::PathBuf,
     fsync: AofFsync,
+    tx: Option<mpsc::Sender<Vec<u8>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,10 +57,62 @@ impl Aof {
             .create(true)
             .open(path)
             .await?;
+        let mut tx = None;
+        if matches!(fsync, AofFsync::EverySec | AofFsync::No) {
+            let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(4096);
+            let inner = std::sync::Arc::new(Mutex::new(
+                OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(path)
+                    .await?,
+            ));
+            let write_inner = inner.clone();
+            tokio::spawn(async move {
+                while let Some(mut batch) = receiver.recv().await {
+                    let mut took = 1usize;
+                    while took < 256 {
+                        match receiver.try_recv() {
+                            Ok(next) => {
+                                batch.extend_from_slice(&next);
+                                took += 1;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let mut file = write_inner.lock().await;
+                    let _ = file.write_all(&batch).await;
+                }
+            });
+            tx = Some(sender);
+            let aof = Self {
+                inner,
+                path: path.to_path_buf(),
+                fsync,
+                tx,
+            };
+
+            if matches!(fsync, AofFsync::EverySec) {
+                let inner = aof.inner.clone();
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                    loop {
+                        interval.tick().await;
+                        let mut file = inner.lock().await;
+                        let _ = file.flush().await;
+                        let _ = file.sync_data().await;
+                    }
+                });
+            }
+
+            return Ok(aof);
+        }
+
         let aof = Self {
             inner: std::sync::Arc::new(Mutex::new(file)),
             path: path.to_path_buf(),
             fsync,
+            tx,
         };
 
         if matches!(fsync, AofFsync::EverySec) {
@@ -83,20 +137,25 @@ impl Aof {
 
     pub async fn append(&self, record: LogRecord) -> Result<(), Box<dyn std::error::Error>> {
         let payload = encode_record(record);
+        let mut wire = Vec::with_capacity(4 + payload.len());
+        wire.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        wire.extend_from_slice(&payload);
+
+        if let Some(tx) = &self.tx {
+            tx.send(wire)
+                .await
+                .map_err(|_| "AOF writer task is not available")?;
+            return Ok(());
+        }
 
         let mut file = self.inner.lock().await;
-        file.write_all(&(payload.len() as u32).to_be_bytes())
-            .await?;
-        file.write_all(&payload).await?;
+        file.write_all(&wire).await?;
         match self.fsync {
             AofFsync::Always => {
                 file.flush().await?;
                 file.sync_data().await?;
             }
-            AofFsync::EverySec => {
-                file.flush().await?;
-            }
-            AofFsync::No => {}
+            AofFsync::EverySec | AofFsync::No => {}
         }
         Ok(())
     }

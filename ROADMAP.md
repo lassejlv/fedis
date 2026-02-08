@@ -16,7 +16,11 @@ Ship a fast, lightweight Redis-compatible server in focused milestones while tra
 - Client compatibility shims: `HELLO`, `CLIENT SETINFO|SETNAME|GETNAME|ID|TRACKING`, `MEMORY USAGE|STATS`, `OBJECT ENCODING|IDLETIME|FREQ|REFCOUNT`
 - Meta compatibility shims: `COMMAND`, `CONFIG GET|RESETSTAT`, `LATENCY`, `SLOWLOG`
 - Key discovery: `KEYS`, `SCAN`
-- Persistence: append-only log replay at startup, fsync policy (`always|everysec|no`), basic AOF rewrite (`BGREWRITEAOF`)
+- Persistence: append-only log replay at startup, fsync policy (`always|everysec|no`), batched AOF writes, AOF rewrite (`BGREWRITEAOF`), snapshot persistence (`SAVE`/`BGSAVE`/`LASTSAVE`)
+- Protocol compatibility: selective RESP3 output for `HELLO 3`
+- Operations: structured logs, metrics endpoint, config file support, graceful shutdown
+- Recovery and validation: restart recovery tests for AOF and snapshot + AOF
+- Performance tooling: baseline benchmark runner + thresholds (`benchmarks/run_bench.py`, `benchmarks/thresholds.json`)
 
 ### Compatibility Notes
 - `SCAN` is stateless and cursor is an index into a sorted snapshot of matching keys
@@ -29,24 +33,12 @@ Ship a fast, lightweight Redis-compatible server in focused milestones while tra
 - Improve exact Redis-like error texts and argument validation
 
 ## M2 - Protocol and Client Compatibility
-- Add selective RESP3 support where required by popular clients
-- Expand `CLIENT` subcommand coverage (`LIST`, `INFO`, `PAUSE`, `UNPAUSE` as needed)
-- Add optional command table exposure (`COMMAND`) for discovery
-
 ## M3 - Storage and Durability
-- Optional RDB-like snapshot support
-- Crash recovery validation suite
 
 ## M4 - Performance
 - Sharded store to reduce write contention
-- Parser and response encoding allocation reductions
-- Batched AOF writes and background flush tuning
-- Benchmarks and regression thresholds
 
 ## M5 - Operations
-- Structured logs and metrics export endpoint
-- Config file support in addition to env vars
-- Graceful shutdown and signal handling
 
 ## Tracking
 Use this legend when adding new commands:

@@ -58,8 +58,9 @@ impl CommandExecutor {
         args: &[Vec<u8>],
         session: &mut SessionAuth,
     ) -> (RespValue, SessionAction) {
+        let mut proto = 2_i64;
         if args.len() > 1 {
-            let Some(proto) = parse_i64(&args[1]) else {
+            let Some(parsed) = parse_i64(&args[1]) else {
                 return (
                     RespValue::Error(
                         "ERR Protocol version is not an integer or out of range".to_string(),
@@ -67,12 +68,13 @@ impl CommandExecutor {
                     SessionAction::Continue,
                 );
             };
-            if proto != 2 && proto != 3 {
+            if parsed != 2 && parsed != 3 {
                 return (
                     RespValue::Error("NOPROTO unsupported protocol version".to_string()),
                     SessionAction::Continue,
                 );
             }
+            proto = parsed;
         }
 
         let mut idx = 2;
@@ -132,25 +134,44 @@ impl CommandExecutor {
             }
         }
 
-        (
-            RespValue::Array(vec![
+        let fields = vec![
+            (
                 RespValue::Bulk(Some(b"server".to_vec())),
                 RespValue::Bulk(Some(b"redis".to_vec())),
+            ),
+            (
                 RespValue::Bulk(Some(b"version".to_vec())),
                 RespValue::Bulk(Some(b"7.2.0-fedis".to_vec())),
+            ),
+            (
                 RespValue::Bulk(Some(b"proto".to_vec())),
-                RespValue::Integer(2),
-                RespValue::Bulk(Some(b"id".to_vec())),
-                RespValue::Integer(0),
+                RespValue::Integer(proto),
+            ),
+            (RespValue::Bulk(Some(b"id".to_vec())), RespValue::Integer(0)),
+            (
                 RespValue::Bulk(Some(b"mode".to_vec())),
                 RespValue::Bulk(Some(b"standalone".to_vec())),
+            ),
+            (
                 RespValue::Bulk(Some(b"role".to_vec())),
                 RespValue::Bulk(Some(b"master".to_vec())),
+            ),
+            (
                 RespValue::Bulk(Some(b"modules".to_vec())),
                 RespValue::Array(Vec::new()),
-            ]),
-            SessionAction::Continue,
-        )
+            ),
+        ];
+
+        if proto == 3 {
+            (RespValue::Map(fields), SessionAction::Continue)
+        } else {
+            let mut flat = Vec::with_capacity(fields.len() * 2);
+            for (k, v) in fields {
+                flat.push(k);
+                flat.push(v);
+            }
+            (RespValue::Array(flat), SessionAction::Continue)
+        }
     }
 
     pub(super) async fn client(
@@ -233,17 +254,30 @@ impl CommandExecutor {
     }
 
     pub(super) fn command_meta(&self, args: &[Vec<u8>]) -> (RespValue, SessionAction) {
+        let table = command_table();
         if args.len() == 1 {
-            return (RespValue::Array(Vec::new()), SessionAction::Continue);
+            let payload = table
+                .iter()
+                .map(command_meta_entry)
+                .collect::<Vec<RespValue>>();
+            return (RespValue::Array(payload), SessionAction::Continue);
         }
 
         let sub = upper(&args[1]);
         match sub.as_str() {
-            "COUNT" => (RespValue::Integer(0), SessionAction::Continue),
+            "COUNT" => (
+                RespValue::Integer(table.len() as i64),
+                SessionAction::Continue,
+            ),
             "INFO" => {
                 let mut out = Vec::new();
-                for _ in args.iter().skip(2) {
-                    out.push(RespValue::Bulk(None));
+                for name in args.iter().skip(2) {
+                    let needle = String::from_utf8_lossy(name).to_ascii_uppercase();
+                    if let Some(spec) = table.iter().find(|spec| spec.name == needle) {
+                        out.push(command_meta_entry(spec));
+                    } else {
+                        out.push(RespValue::Bulk(None));
+                    }
                 }
                 (RespValue::Array(out), SessionAction::Continue)
             }
@@ -374,6 +408,65 @@ impl CommandExecutor {
         }
     }
 
+    pub(super) async fn bgsave(&self, args: &[Vec<u8>]) -> (RespValue, SessionAction) {
+        if args.len() != 1 {
+            return (
+                RespValue::Error("ERR wrong number of arguments for 'bgsave' command".to_string()),
+                SessionAction::Continue,
+            );
+        }
+
+        if self.store.bgsave().await {
+            (
+                RespValue::Simple("Background saving started".to_string()),
+                SessionAction::Continue,
+            )
+        } else {
+            (
+                RespValue::Error(
+                    "ERR Background save already in progress or snapshots disabled".to_string(),
+                ),
+                SessionAction::Continue,
+            )
+        }
+    }
+
+    pub(super) async fn save(&self, args: &[Vec<u8>]) -> (RespValue, SessionAction) {
+        if args.len() != 1 {
+            return (
+                RespValue::Error("ERR wrong number of arguments for 'save' command".to_string()),
+                SessionAction::Continue,
+            );
+        }
+
+        match self.store.save_snapshot_now().await {
+            Ok(()) => (RespValue::Simple("OK".to_string()), SessionAction::Continue),
+            Err(_) => (
+                RespValue::Error("ERR snapshots are not configured".to_string()),
+                SessionAction::Continue,
+            ),
+        }
+    }
+
+    pub(super) fn lastsave(&self, args: &[Vec<u8>]) -> (RespValue, SessionAction) {
+        if args.len() != 1 {
+            return (
+                RespValue::Error(
+                    "ERR wrong number of arguments for 'lastsave' command".to_string(),
+                ),
+                SessionAction::Continue,
+            );
+        }
+
+        let metrics = self.store.persistence_metrics();
+        let ts = if metrics.last_snapshot_epoch_sec > 0 {
+            metrics.last_snapshot_epoch_sec as i64
+        } else {
+            (now_ms() / 1000) as i64
+        };
+        (RespValue::Integer(ts), SessionAction::Continue)
+    }
+
     pub(super) fn auth_cmd(
         &self,
         args: &[Vec<u8>],
@@ -419,4 +512,459 @@ impl CommandExecutor {
             ),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct CommandSpec {
+    name: &'static str,
+    arity: i64,
+    flags: &'static [&'static str],
+    first_key: i64,
+    last_key: i64,
+    step: i64,
+}
+
+fn command_meta_entry(spec: &CommandSpec) -> RespValue {
+    RespValue::Array(vec![
+        RespValue::Bulk(Some(spec.name.to_ascii_lowercase().into_bytes())),
+        RespValue::Integer(spec.arity),
+        RespValue::Array(
+            spec.flags
+                .iter()
+                .map(|v| RespValue::Bulk(Some(v.as_bytes().to_vec())))
+                .collect(),
+        ),
+        RespValue::Integer(spec.first_key),
+        RespValue::Integer(spec.last_key),
+        RespValue::Integer(spec.step),
+    ])
+}
+
+fn command_table() -> &'static [CommandSpec] {
+    &[
+        CommandSpec {
+            name: "APPEND",
+            arity: 3,
+            flags: &["write"],
+            first_key: 1,
+            last_key: 1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "AUTH",
+            arity: -2,
+            flags: &["fast"],
+            first_key: 0,
+            last_key: 0,
+            step: 0,
+        },
+        CommandSpec {
+            name: "BGSAVE",
+            arity: 1,
+            flags: &["admin"],
+            first_key: 0,
+            last_key: 0,
+            step: 0,
+        },
+        CommandSpec {
+            name: "BGREWRITEAOF",
+            arity: 1,
+            flags: &["admin"],
+            first_key: 0,
+            last_key: 0,
+            step: 0,
+        },
+        CommandSpec {
+            name: "CLIENT",
+            arity: -2,
+            flags: &["admin"],
+            first_key: 0,
+            last_key: 0,
+            step: 0,
+        },
+        CommandSpec {
+            name: "COMMAND",
+            arity: -1,
+            flags: &["admin"],
+            first_key: 0,
+            last_key: 0,
+            step: 0,
+        },
+        CommandSpec {
+            name: "CONFIG",
+            arity: -2,
+            flags: &["admin"],
+            first_key: 0,
+            last_key: 0,
+            step: 0,
+        },
+        CommandSpec {
+            name: "DBSIZE",
+            arity: 1,
+            flags: &["readonly", "fast"],
+            first_key: 0,
+            last_key: 0,
+            step: 0,
+        },
+        CommandSpec {
+            name: "DECR",
+            arity: 2,
+            flags: &["write", "fast"],
+            first_key: 1,
+            last_key: 1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "DECRBY",
+            arity: 3,
+            flags: &["write", "fast"],
+            first_key: 1,
+            last_key: 1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "DEL",
+            arity: -2,
+            flags: &["write"],
+            first_key: 1,
+            last_key: -1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "ECHO",
+            arity: 2,
+            flags: &["fast"],
+            first_key: 0,
+            last_key: 0,
+            step: 0,
+        },
+        CommandSpec {
+            name: "EXISTS",
+            arity: -2,
+            flags: &["readonly", "fast"],
+            first_key: 1,
+            last_key: -1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "EXPIRE",
+            arity: 3,
+            flags: &["write", "fast"],
+            first_key: 1,
+            last_key: 1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "EXPIREAT",
+            arity: 3,
+            flags: &["write", "fast"],
+            first_key: 1,
+            last_key: 1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "GET",
+            arity: 2,
+            flags: &["readonly", "fast"],
+            first_key: 1,
+            last_key: 1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "GETDEL",
+            arity: 2,
+            flags: &["write", "fast"],
+            first_key: 1,
+            last_key: 1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "GETEX",
+            arity: -2,
+            flags: &["write", "fast"],
+            first_key: 1,
+            last_key: 1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "GETRANGE",
+            arity: 4,
+            flags: &["readonly"],
+            first_key: 1,
+            last_key: 1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "GETSET",
+            arity: 3,
+            flags: &["write", "fast"],
+            first_key: 1,
+            last_key: 1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "HELLO",
+            arity: -1,
+            flags: &["fast"],
+            first_key: 0,
+            last_key: 0,
+            step: 0,
+        },
+        CommandSpec {
+            name: "INCR",
+            arity: 2,
+            flags: &["write", "fast"],
+            first_key: 1,
+            last_key: 1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "INCRBY",
+            arity: 3,
+            flags: &["write", "fast"],
+            first_key: 1,
+            last_key: 1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "INFO",
+            arity: -1,
+            flags: &["readonly"],
+            first_key: 0,
+            last_key: 0,
+            step: 0,
+        },
+        CommandSpec {
+            name: "KEYS",
+            arity: 2,
+            flags: &["readonly"],
+            first_key: 0,
+            last_key: 0,
+            step: 0,
+        },
+        CommandSpec {
+            name: "LATENCY",
+            arity: -2,
+            flags: &["admin"],
+            first_key: 0,
+            last_key: 0,
+            step: 0,
+        },
+        CommandSpec {
+            name: "LASTSAVE",
+            arity: 1,
+            flags: &["readonly"],
+            first_key: 0,
+            last_key: 0,
+            step: 0,
+        },
+        CommandSpec {
+            name: "MEMORY",
+            arity: -2,
+            flags: &["readonly"],
+            first_key: 0,
+            last_key: 0,
+            step: 0,
+        },
+        CommandSpec {
+            name: "MGET",
+            arity: -2,
+            flags: &["readonly"],
+            first_key: 1,
+            last_key: -1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "MSET",
+            arity: -3,
+            flags: &["write"],
+            first_key: 1,
+            last_key: -1,
+            step: 2,
+        },
+        CommandSpec {
+            name: "MSETNX",
+            arity: -3,
+            flags: &["write"],
+            first_key: 1,
+            last_key: -1,
+            step: 2,
+        },
+        CommandSpec {
+            name: "OBJECT",
+            arity: -3,
+            flags: &["readonly"],
+            first_key: 2,
+            last_key: 2,
+            step: 1,
+        },
+        CommandSpec {
+            name: "PERSIST",
+            arity: 2,
+            flags: &["write", "fast"],
+            first_key: 1,
+            last_key: 1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "PEXPIRE",
+            arity: 3,
+            flags: &["write", "fast"],
+            first_key: 1,
+            last_key: 1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "PEXPIREAT",
+            arity: 3,
+            flags: &["write", "fast"],
+            first_key: 1,
+            last_key: 1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "PING",
+            arity: -1,
+            flags: &["fast"],
+            first_key: 0,
+            last_key: 0,
+            step: 0,
+        },
+        CommandSpec {
+            name: "PSETEX",
+            arity: 4,
+            flags: &["write"],
+            first_key: 1,
+            last_key: 1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "PTTL",
+            arity: 2,
+            flags: &["readonly", "fast"],
+            first_key: 1,
+            last_key: 1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "QUIT",
+            arity: 1,
+            flags: &["fast"],
+            first_key: 0,
+            last_key: 0,
+            step: 0,
+        },
+        CommandSpec {
+            name: "SCAN",
+            arity: -2,
+            flags: &["readonly"],
+            first_key: 0,
+            last_key: 0,
+            step: 0,
+        },
+        CommandSpec {
+            name: "SAVE",
+            arity: 1,
+            flags: &["admin"],
+            first_key: 0,
+            last_key: 0,
+            step: 0,
+        },
+        CommandSpec {
+            name: "SELECT",
+            arity: 2,
+            flags: &["fast"],
+            first_key: 0,
+            last_key: 0,
+            step: 0,
+        },
+        CommandSpec {
+            name: "SET",
+            arity: -3,
+            flags: &["write"],
+            first_key: 1,
+            last_key: 1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "SETEX",
+            arity: 4,
+            flags: &["write"],
+            first_key: 1,
+            last_key: 1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "SETNX",
+            arity: 3,
+            flags: &["write", "fast"],
+            first_key: 1,
+            last_key: 1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "SETRANGE",
+            arity: 4,
+            flags: &["write"],
+            first_key: 1,
+            last_key: 1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "SLOWLOG",
+            arity: -2,
+            flags: &["admin"],
+            first_key: 0,
+            last_key: 0,
+            step: 0,
+        },
+        CommandSpec {
+            name: "STRLEN",
+            arity: 2,
+            flags: &["readonly", "fast"],
+            first_key: 1,
+            last_key: 1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "TIME",
+            arity: 1,
+            flags: &["fast"],
+            first_key: 0,
+            last_key: 0,
+            step: 0,
+        },
+        CommandSpec {
+            name: "TTL",
+            arity: 2,
+            flags: &["readonly", "fast"],
+            first_key: 1,
+            last_key: 1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "TYPE",
+            arity: 2,
+            flags: &["readonly", "fast"],
+            first_key: 1,
+            last_key: 1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "UNLINK",
+            arity: -2,
+            flags: &["write"],
+            first_key: 1,
+            last_key: -1,
+            step: 1,
+        },
+        CommandSpec {
+            name: "UPDATE",
+            arity: -3,
+            flags: &["write"],
+            first_key: 1,
+            last_key: 1,
+            step: 1,
+        },
+    ]
 }

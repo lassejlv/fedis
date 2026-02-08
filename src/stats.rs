@@ -9,6 +9,8 @@ pub struct ServerStats {
     total_connections: AtomicU64,
     total_commands: AtomicU64,
     total_command_usec: AtomicU64,
+    ops_window: AtomicU64,
+    ops_per_sec: AtomicU64,
     command_calls: Mutex<HashMap<String, CommandTiming>>,
 }
 
@@ -26,6 +28,8 @@ impl ServerStats {
             total_connections: AtomicU64::new(0),
             total_commands: AtomicU64::new(0),
             total_command_usec: AtomicU64::new(0),
+            ops_window: AtomicU64::new(0),
+            ops_per_sec: AtomicU64::new(0),
             command_calls: Mutex::new(HashMap::new()),
         }
     }
@@ -43,6 +47,7 @@ impl ServerStats {
         self.total_commands.fetch_add(1, Ordering::Relaxed);
         self.total_command_usec
             .fetch_add(elapsed_usec, Ordering::Relaxed);
+        self.ops_window.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut calls) = self.command_calls.lock() {
             let key = command.to_ascii_lowercase();
             let entry = calls
@@ -71,6 +76,15 @@ impl ServerStats {
 
     pub fn total_command_usec(&self) -> u64 {
         self.total_command_usec.load(Ordering::Relaxed)
+    }
+
+    pub fn instantaneous_ops_per_sec(&self) -> u64 {
+        self.ops_per_sec.load(Ordering::Relaxed)
+    }
+
+    pub fn tick_ops_per_sec(&self) {
+        let window = self.ops_window.swap(0, Ordering::Relaxed);
+        self.ops_per_sec.store(window, Ordering::Relaxed);
     }
 
     pub fn command_stats_snapshot(&self) -> Vec<(String, u64, u64)> {

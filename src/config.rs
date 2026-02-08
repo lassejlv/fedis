@@ -13,28 +13,41 @@ pub struct Config {
     pub users: HashMap<String, User>,
     pub default_user: String,
     pub aof_fsync: AofFsync,
+    pub snapshot_path: Option<PathBuf>,
+    pub snapshot_interval_sec: Option<u64>,
+    pub metrics_addr: Option<String>,
     pub non_redis_mode: bool,
     pub debug_response_ids: bool,
 }
 
 impl Config {
     pub fn from_env_and_args() -> Result<Self, Box<dyn std::error::Error>> {
-        let host = env::var("FEDIS_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-        let port = env::var("FEDIS_PORT").unwrap_or_else(|_| "6379".to_string());
-        let mut listen_addr =
-            env::var("FEDIS_LISTEN").unwrap_or_else(|_| format!("{}:{}", host, port));
-        let mut users: HashMap<String, User> = HashMap::new();
-        let mut default_user = env::var("FEDIS_USERNAME").unwrap_or_else(|_| "default".to_string());
+        let file_settings = if let Ok(path) = env::var("FEDIS_CONFIG") {
+            parse_env_file(std::path::Path::new(&path))?
+        } else {
+            HashMap::new()
+        };
+        let setting = |key: &str| -> Option<String> {
+            env::var(key)
+                .ok()
+                .or_else(|| file_settings.get(key).cloned())
+        };
 
-        let data_path = env::var("FEDIS_DATA_PATH").unwrap_or_else(|_| ".".to_string());
+        let host = setting("FEDIS_HOST").unwrap_or_else(|| "127.0.0.1".to_string());
+        let port = setting("FEDIS_PORT").unwrap_or_else(|| "6379".to_string());
+        let mut listen_addr =
+            setting("FEDIS_LISTEN").unwrap_or_else(|| format!("{}:{}", host, port));
+        let mut users: HashMap<String, User> = HashMap::new();
+        let mut default_user = setting("FEDIS_USERNAME").unwrap_or_else(|| "default".to_string());
+
+        let data_path = setting("FEDIS_DATA_PATH").unwrap_or_else(|| ".".to_string());
         let mut aof_path = PathBuf::from(data_path).join("fedis.aof");
 
-        if let Ok(password) = env::var("FEDIS_PASSWORD") {
-            let enabled = env::var("FEDIS_USER_ENABLED")
-                .map(|v| parse_bool(&v))
+        if let Some(password) = setting("FEDIS_PASSWORD") {
+            let enabled = setting("FEDIS_USER_ENABLED")
+                .map(|v| parse_bool(v.as_str()))
                 .unwrap_or(true);
-            let permissions = env::var("FEDIS_USER_COMMANDS")
-                .ok()
+            let permissions = setting("FEDIS_USER_COMMANDS")
                 .map(|v| parse_permissions(Some(v.as_str())))
                 .unwrap_or(Permissions::All);
             users.insert(
@@ -43,7 +56,7 @@ impl Config {
             );
         }
 
-        if let Ok(user_list) = env::var("FEDIS_USERS") {
+        if let Some(user_list) = setting("FEDIS_USERS") {
             for pair in user_list
                 .split(',')
                 .map(|v| v.trim())
@@ -82,7 +95,7 @@ impl Config {
             }
         }
 
-        if let Ok(url) = env::var("FEDIS_URL") {
+        if let Some(url) = setting("FEDIS_URL") {
             let parsed = Self::parse_redis_url(&url)?;
             listen_addr = parsed.0;
             if let Some((u, p, perms)) = parsed.1 {
@@ -91,7 +104,7 @@ impl Config {
             }
         }
 
-        if let Ok(path) = env::var("FEDIS_AOF_PATH") {
+        if let Some(path) = setting("FEDIS_AOF_PATH") {
             aof_path = PathBuf::from(path);
         }
 
@@ -106,13 +119,25 @@ impl Config {
             }
         }
 
-        let non_redis_mode = env::var("FEDIS_NON_REDIS_MODE")
-            .map(|v| parse_bool(&v))
+        let non_redis_mode = setting("FEDIS_NON_REDIS_MODE")
+            .map(|v| parse_bool(v.as_str()))
             .unwrap_or(false);
-        let debug_response_ids = env::var("FEDIS_DEBUG_RESPONSE_ID")
-            .map(|v| parse_bool(&v))
+        let debug_response_ids = setting("FEDIS_DEBUG_RESPONSE_ID")
+            .map(|v| parse_bool(v.as_str()))
             .unwrap_or(false);
-        let aof_fsync = parse_aof_fsync(env::var("FEDIS_AOF_FSYNC").ok().as_deref())?;
+        let aof_fsync = parse_aof_fsync(setting("FEDIS_AOF_FSYNC").as_deref())?;
+        let snapshot_path = setting("FEDIS_SNAPSHOT_PATH").map(PathBuf::from);
+        let snapshot_interval_sec = setting("FEDIS_SNAPSHOT_INTERVAL_SEC")
+            .as_deref()
+            .map(parse_u64)
+            .transpose()?;
+        let metrics_addr = setting("FEDIS_METRICS_ADDR");
+
+        if let Some(path) = &snapshot_path {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
 
         Ok(Self {
             listen_addr,
@@ -120,6 +145,9 @@ impl Config {
             users,
             default_user,
             aof_fsync,
+            snapshot_path,
+            snapshot_interval_sec,
+            metrics_addr,
             non_redis_mode,
             debug_response_ids,
         })
@@ -157,6 +185,23 @@ impl Config {
 
         Ok((listen_addr, auth))
     }
+}
+
+fn parse_env_file(
+    path: &std::path::Path,
+) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+    let contents = std::fs::read_to_string(path)?;
+    let mut out = HashMap::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            out.insert(k.trim().to_string(), v.trim().to_string());
+        }
+    }
+    Ok(out)
 }
 
 fn parse_permissions(raw: Option<&str>) -> Permissions {
@@ -207,4 +252,11 @@ fn parse_aof_fsync(value: Option<&str>) -> Result<AofFsync, Box<dyn std::error::
         "no" => Ok(AofFsync::No),
         _ => Err("FEDIS_AOF_FSYNC must be one of: always, everysec, no".into()),
     }
+}
+
+fn parse_u64(value: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| "value must be an unsigned integer".into())
 }

@@ -12,7 +12,7 @@ async fn make_executor() -> (CommandExecutor, SessionAuth, PathBuf) {
     let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!("fedis-test-{}-{}.aof", std::process::id(), id));
     let aof = Aof::open(&path, AofFsync::Always).await.expect("open aof");
-    let store = Store::new(aof).await.expect("new store");
+    let store = Store::new(aof, None).await.expect("new store");
     let users: HashMap<String, User> = HashMap::new();
     let auth = Auth::new(users, "default".to_string());
     let executor = CommandExecutor::new(

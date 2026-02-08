@@ -26,7 +26,7 @@ pub struct Server {
 impl Server {
     pub async fn new(config: Config) -> Result<Self, Box<dyn std::error::Error>> {
         let aof = Aof::open(&config.aof_path, config.aof_fsync).await?;
-        let store = Store::new(aof).await?;
+        let store = Store::new(aof, config.snapshot_path.clone()).await?;
         let auth = Auth::new(config.users.clone(), config.default_user.clone());
         let stats = Arc::new(ServerStats::new());
         let executor = Arc::new(CommandExecutor::new(
@@ -58,6 +58,17 @@ impl Server {
                 "FEDIS_DEBUG_RESPONSE_ID is enabled but FEDIS_NON_REDIS_MODE is off; response IDs are disabled"
             );
         }
+
+        if let Some(metrics_addr) = &self.config.metrics_addr {
+            let stats = self.stats.clone();
+            let store = self.store.clone();
+            let addr = metrics_addr.clone();
+            tokio::spawn(async move {
+                if let Err(e) = run_metrics_server(addr, stats, store).await {
+                    warn!(error = %e, "metrics server failed");
+                }
+            });
+        }
         let cleanup_store = self.store.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(500));
@@ -67,8 +78,37 @@ impl Server {
             }
         });
 
+        if let Some(interval_sec) = self.config.snapshot_interval_sec {
+            let save_store = self.store.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(interval_sec.max(1)));
+                loop {
+                    ticker.tick().await;
+                    let _ = save_store.bgsave().await;
+                }
+            });
+        }
+
+        let stats = self.stats.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                ticker.tick().await;
+                stats.tick_ops_per_sec();
+            }
+        });
+
+        let mut shutdown = std::pin::pin!(tokio::signal::ctrl_c());
         loop {
-            let (socket, peer_addr) = listener.accept().await?;
+            let accept_result = tokio::select! {
+                _ = &mut shutdown => {
+                    info!("shutdown signal received");
+                    break;
+                }
+                accepted = listener.accept() => accepted,
+            };
+
+            let (socket, peer_addr) = accept_result?;
             let executor = self.executor.clone();
             let stats = self.stats.clone();
             let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
@@ -91,7 +131,117 @@ impl Server {
                 info!(connection_id, peer = %peer_addr, "client disconnected");
             });
         }
+
+        info!("server stopped");
+        Ok(())
     }
+}
+
+async fn run_metrics_server(
+    metrics_addr: String,
+    stats: Arc<ServerStats>,
+    store: Store,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind(&metrics_addr).await?;
+    info!(metrics_addr = %listener.local_addr()?, "metrics server started");
+
+    loop {
+        let (mut socket, _) = listener.accept().await?;
+        let metrics = format_metrics(&stats, &store).await;
+        let body = metrics.into_bytes();
+        let header = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/plain; version=0.0.4\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        socket.write_all(header.as_bytes()).await?;
+        socket.write_all(&body).await?;
+        socket.flush().await?;
+    }
+}
+
+async fn format_metrics(stats: &ServerStats, store: &Store) -> String {
+    let store_metrics = store.metrics().await;
+    let persistence = store.persistence_metrics();
+    let command_stats = stats.command_stats_snapshot();
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "fedis_connected_clients {}\n",
+        stats.connected_clients()
+    ));
+    out.push_str(&format!(
+        "fedis_total_connections {}\n",
+        stats.total_connections()
+    ));
+    out.push_str(&format!(
+        "fedis_total_commands {}\n",
+        stats.total_commands()
+    ));
+    out.push_str(&format!(
+        "fedis_instantaneous_ops_per_sec {}\n",
+        stats.instantaneous_ops_per_sec()
+    ));
+    out.push_str(&format!(
+        "fedis_total_command_usec {}\n",
+        stats.total_command_usec()
+    ));
+    out.push_str(&format!("fedis_keys {}\n", store_metrics.keys));
+    out.push_str(&format!(
+        "fedis_expiring_keys {}\n",
+        store_metrics.expiring_keys
+    ));
+    out.push_str(&format!(
+        "fedis_memory_bytes {}\n",
+        store_metrics.approx_memory_bytes
+    ));
+    out.push_str(&format!(
+        "fedis_aof_rewrite_in_progress {}\n",
+        if persistence.rewrite_in_progress {
+            1
+        } else {
+            0
+        }
+    ));
+    out.push_str(&format!(
+        "fedis_aof_rewrites {}\n",
+        persistence.rewrite_count
+    ));
+    out.push_str(&format!(
+        "fedis_aof_rewrite_failures {}\n",
+        persistence.rewrite_fail_count
+    ));
+    out.push_str(&format!(
+        "fedis_snapshot_in_progress {}\n",
+        if persistence.snapshot_in_progress {
+            1
+        } else {
+            0
+        }
+    ));
+    out.push_str(&format!(
+        "fedis_snapshot_saves {}\n",
+        persistence.snapshot_count
+    ));
+    out.push_str(&format!(
+        "fedis_snapshot_failures {}\n",
+        persistence.snapshot_fail_count
+    ));
+    out.push_str(&format!(
+        "fedis_snapshot_last_save_epoch_sec {}\n",
+        persistence.last_snapshot_epoch_sec
+    ));
+
+    for (name, calls, usec) in command_stats {
+        out.push_str(&format!(
+            "fedis_command_calls{{command=\"{}\"}} {}\n",
+            name, calls
+        ));
+        out.push_str(&format!(
+            "fedis_command_usec{{command=\"{}\"}} {}\n",
+            name, usec
+        ));
+    }
+    out
 }
 
 async fn handle_client(

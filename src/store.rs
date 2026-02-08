@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::io::{ErrorKind, Read};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,6 +16,11 @@ pub struct Store {
     rewrite_count: std::sync::Arc<AtomicU64>,
     rewrite_fail_count: std::sync::Arc<AtomicU64>,
     last_rewrite_epoch_sec: std::sync::Arc<AtomicU64>,
+    snapshot_path: Option<PathBuf>,
+    snapshot_in_progress: std::sync::Arc<AtomicBool>,
+    snapshot_count: std::sync::Arc<AtomicU64>,
+    snapshot_fail_count: std::sync::Arc<AtomicU64>,
+    last_snapshot_epoch_sec: std::sync::Arc<AtomicU64>,
 }
 
 pub struct StoreMetrics {
@@ -33,6 +40,10 @@ pub struct PersistenceMetrics {
     pub rewrite_count: u64,
     pub rewrite_fail_count: u64,
     pub last_rewrite_epoch_sec: u64,
+    pub snapshot_in_progress: bool,
+    pub snapshot_count: u64,
+    pub snapshot_fail_count: u64,
+    pub last_snapshot_epoch_sec: u64,
 }
 
 pub enum IncrByError {
@@ -61,7 +72,10 @@ pub enum SetCondition {
 }
 
 impl Store {
-    pub async fn new(aof: Aof) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new(
+        aof: Aof,
+        snapshot_path: Option<PathBuf>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let store = Self {
             state: std::sync::Arc::new(RwLock::new(HashMap::new())),
             aof,
@@ -69,9 +83,34 @@ impl Store {
             rewrite_count: std::sync::Arc::new(AtomicU64::new(0)),
             rewrite_fail_count: std::sync::Arc::new(AtomicU64::new(0)),
             last_rewrite_epoch_sec: std::sync::Arc::new(AtomicU64::new(0)),
+            snapshot_path,
+            snapshot_in_progress: std::sync::Arc::new(AtomicBool::new(false)),
+            snapshot_count: std::sync::Arc::new(AtomicU64::new(0)),
+            snapshot_fail_count: std::sync::Arc::new(AtomicU64::new(0)),
+            last_snapshot_epoch_sec: std::sync::Arc::new(AtomicU64::new(0)),
         };
+        store.load_snapshot().await?;
         store.replay().await?;
         Ok(store)
+    }
+
+    async fn load_snapshot(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(path) = &self.snapshot_path else {
+            return Ok(());
+        };
+        if !path.exists() {
+            return Ok(());
+        }
+
+        let entries = read_snapshot(path)?;
+        let mut state = self.state.write().await;
+        state.clear();
+        for (key, value, expires_at) in entries {
+            if !is_expired(expires_at) {
+                state.insert(key, ValueEntry { value, expires_at });
+            }
+        }
+        Ok(())
     }
 
     async fn replay(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -107,6 +146,17 @@ impl Store {
     }
 
     pub async fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        {
+            let state = self.state.read().await;
+            if let Some(entry) = state.get(key) {
+                if !is_expired(entry.expires_at) {
+                    return Some(entry.value.clone());
+                }
+            } else {
+                return None;
+            }
+        }
+
         let mut state = self.state.write().await;
         if let Some(entry) = state.get(key) {
             if is_expired(entry.expires_at) {
@@ -767,7 +817,56 @@ impl Store {
             rewrite_count: self.rewrite_count.load(Ordering::SeqCst),
             rewrite_fail_count: self.rewrite_fail_count.load(Ordering::SeqCst),
             last_rewrite_epoch_sec: self.last_rewrite_epoch_sec.load(Ordering::SeqCst),
+            snapshot_in_progress: self.snapshot_in_progress.load(Ordering::SeqCst),
+            snapshot_count: self.snapshot_count.load(Ordering::SeqCst),
+            snapshot_fail_count: self.snapshot_fail_count.load(Ordering::SeqCst),
+            last_snapshot_epoch_sec: self.last_snapshot_epoch_sec.load(Ordering::SeqCst),
         }
+    }
+
+    pub async fn save_snapshot_now(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(path) = &self.snapshot_path else {
+            return Err("snapshot path is not configured".into());
+        };
+
+        let entries = {
+            let mut state = self.state.write().await;
+            let now = now_ms();
+            state.retain(|_, v| v.expires_at.is_none_or(|exp| exp > now));
+            state
+                .iter()
+                .map(|(k, v)| (k.clone(), v.value.clone(), v.expires_at))
+                .collect::<Vec<_>>()
+        };
+
+        write_snapshot(path, entries)?;
+        self.snapshot_count.fetch_add(1, Ordering::SeqCst);
+        self.last_snapshot_epoch_sec
+            .store(now_ms() / 1000, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub async fn bgsave(&self) -> bool {
+        if self.snapshot_path.is_none() {
+            return false;
+        }
+
+        if self
+            .snapshot_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return false;
+        }
+
+        let store = self.clone();
+        tokio::spawn(async move {
+            if store.save_snapshot_now().await.is_err() {
+                store.snapshot_fail_count.fetch_add(1, Ordering::SeqCst);
+            }
+            store.snapshot_in_progress.store(false, Ordering::SeqCst);
+        });
+        true
     }
 }
 
@@ -845,4 +944,164 @@ fn slice_range(value: &[u8], start: i64, end: i64) -> Vec<u8> {
     }
 
     value[s as usize..=e as usize].to_vec()
+}
+
+const SNAP_MAGIC: &[u8] = b"FDSNP1";
+
+fn write_snapshot(
+    path: &Path,
+    entries: Vec<(Vec<u8>, Vec<u8>, Option<u64>)>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut out = Vec::new();
+    out.extend_from_slice(SNAP_MAGIC);
+    for (key, value, expires_at) in entries {
+        out.extend_from_slice(&(key.len() as u32).to_be_bytes());
+        out.extend_from_slice(&key);
+        out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        out.extend_from_slice(&value);
+        let exp = expires_at.map(|v| v as i64).unwrap_or(-1);
+        out.extend_from_slice(&exp.to_be_bytes());
+    }
+    let tmp = path.with_extension("snapshot.tmp");
+    std::fs::write(&tmp, out)?;
+    std::fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn read_snapshot(
+    path: &Path,
+) -> Result<Vec<(Vec<u8>, Vec<u8>, Option<u64>)>, Box<dyn std::error::Error>> {
+    let mut bytes = Vec::new();
+    let mut file = std::fs::File::open(path)?;
+    file.read_to_end(&mut bytes)?;
+
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if bytes.len() < SNAP_MAGIC.len() || &bytes[..SNAP_MAGIC.len()] != SNAP_MAGIC {
+        return Err("invalid snapshot magic header".into());
+    }
+
+    let mut idx = SNAP_MAGIC.len();
+    let mut out = Vec::new();
+    while idx < bytes.len() {
+        if idx + 4 > bytes.len() {
+            return Err(
+                std::io::Error::new(ErrorKind::InvalidData, "truncated snapshot key len").into(),
+            );
+        }
+        let klen = u32::from_be_bytes(bytes[idx..idx + 4].try_into()?) as usize;
+        idx += 4;
+        if idx + klen > bytes.len() {
+            return Err(
+                std::io::Error::new(ErrorKind::InvalidData, "truncated snapshot key").into(),
+            );
+        }
+        let key = bytes[idx..idx + klen].to_vec();
+        idx += klen;
+
+        if idx + 4 > bytes.len() {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "truncated snapshot value len",
+            )
+            .into());
+        }
+        let vlen = u32::from_be_bytes(bytes[idx..idx + 4].try_into()?) as usize;
+        idx += 4;
+        if idx + vlen > bytes.len() {
+            return Err(
+                std::io::Error::new(ErrorKind::InvalidData, "truncated snapshot value").into(),
+            );
+        }
+        let value = bytes[idx..idx + vlen].to_vec();
+        idx += vlen;
+
+        if idx + 8 > bytes.len() {
+            return Err(
+                std::io::Error::new(ErrorKind::InvalidData, "truncated snapshot expiry").into(),
+            );
+        }
+        let exp = i64::from_be_bytes(bytes[idx..idx + 8].try_into()?);
+        idx += 8;
+        let expires_at = if exp < 0 { None } else { Some(exp as u64) };
+        out.push((key, value, expires_at));
+    }
+
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persistence::AofFsync;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn temp_paths() -> (PathBuf, PathBuf) {
+        let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("fedis-store-test-{}-{}", std::process::id(), id));
+        let _ = std::fs::create_dir_all(&root);
+        (root.join("test.aof"), root.join("test.snapshot"))
+    }
+
+    #[tokio::test]
+    async fn restart_recovers_from_aof_and_snapshot() {
+        let (aof_path, snapshot_path) = temp_paths();
+
+        let aof = Aof::open(&aof_path, AofFsync::Always)
+            .await
+            .expect("open aof");
+        let store = Store::new(aof, Some(snapshot_path.clone()))
+            .await
+            .expect("new store");
+
+        let _ = store
+            .set(b"k".to_vec(), b"v1".to_vec(), None, SetCondition::None)
+            .await
+            .expect("set v1");
+        store.save_snapshot_now().await.expect("save snapshot");
+        let _ = store
+            .set(b"k".to_vec(), b"v2".to_vec(), None, SetCondition::None)
+            .await
+            .expect("set v2");
+        drop(store);
+
+        let aof = Aof::open(&aof_path, AofFsync::Always)
+            .await
+            .expect("reopen aof");
+        let store = Store::new(aof, Some(snapshot_path.clone()))
+            .await
+            .expect("reopen store");
+
+        assert_eq!(store.get(b"k").await, Some(b"v2".to_vec()));
+
+        let _ = std::fs::remove_file(&aof_path);
+        let _ = std::fs::remove_file(&snapshot_path);
+    }
+
+    #[tokio::test]
+    async fn restart_recovers_from_aof_without_snapshot() {
+        let (aof_path, _) = temp_paths();
+
+        let aof = Aof::open(&aof_path, AofFsync::Always)
+            .await
+            .expect("open aof");
+        let store = Store::new(aof, None).await.expect("new store");
+        let _ = store
+            .set(b"a".to_vec(), b"1".to_vec(), None, SetCondition::None)
+            .await
+            .expect("set key");
+        drop(store);
+
+        let aof = Aof::open(&aof_path, AofFsync::Always)
+            .await
+            .expect("reopen aof");
+        let store = Store::new(aof, None).await.expect("reopen store");
+        assert_eq!(store.get(b"a").await, Some(b"1".to_vec()));
+
+        let _ = std::fs::remove_file(&aof_path);
+    }
 }

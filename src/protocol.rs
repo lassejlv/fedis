@@ -7,6 +7,7 @@ pub enum RespValue {
     Integer(i64),
     Bulk(Option<Vec<u8>>),
     Array(Vec<RespValue>),
+    Map(Vec<(RespValue, RespValue)>),
 }
 
 pub async fn read_frame<R>(reader: &mut R) -> Result<Option<RespValue>, Box<dyn std::error::Error>>
@@ -64,23 +65,52 @@ where
 }
 
 pub fn encode(value: RespValue) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    encode_into(&mut out, value);
+    out
+}
+
+fn encode_into(dst: &mut Vec<u8>, value: RespValue) {
     match value {
-        RespValue::Simple(v) => format!("+{}\r\n", v).into_bytes(),
-        RespValue::Error(v) => format!("-{}\r\n", v).into_bytes(),
-        RespValue::Integer(v) => format!(":{}\r\n", v).into_bytes(),
-        RespValue::Bulk(None) => b"$-1\r\n".to_vec(),
+        RespValue::Simple(v) => {
+            dst.push(b'+');
+            dst.extend_from_slice(v.as_bytes());
+            dst.extend_from_slice(b"\r\n");
+        }
+        RespValue::Error(v) => {
+            dst.push(b'-');
+            dst.extend_from_slice(v.as_bytes());
+            dst.extend_from_slice(b"\r\n");
+        }
+        RespValue::Integer(v) => {
+            dst.push(b':');
+            dst.extend_from_slice(v.to_string().as_bytes());
+            dst.extend_from_slice(b"\r\n");
+        }
+        RespValue::Bulk(None) => dst.extend_from_slice(b"$-1\r\n"),
         RespValue::Bulk(Some(v)) => {
-            let mut out = format!("${}\r\n", v.len()).into_bytes();
-            out.extend_from_slice(&v);
-            out.extend_from_slice(b"\r\n");
-            out
+            dst.push(b'$');
+            dst.extend_from_slice(v.len().to_string().as_bytes());
+            dst.extend_from_slice(b"\r\n");
+            dst.extend_from_slice(&v);
+            dst.extend_from_slice(b"\r\n");
         }
         RespValue::Array(values) => {
-            let mut out = format!("*{}\r\n", values.len()).into_bytes();
+            dst.push(b'*');
+            dst.extend_from_slice(values.len().to_string().as_bytes());
+            dst.extend_from_slice(b"\r\n");
             for value in values {
-                out.extend_from_slice(&encode(value));
+                encode_into(dst, value);
             }
-            out
+        }
+        RespValue::Map(entries) => {
+            dst.push(b'%');
+            dst.extend_from_slice(entries.len().to_string().as_bytes());
+            dst.extend_from_slice(b"\r\n");
+            for (k, v) in entries {
+                encode_into(dst, k);
+                encode_into(dst, v);
+            }
         }
     }
 }

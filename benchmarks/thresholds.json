@@ -1,0 +1,5 @@
+{
+  "set_ops_per_sec_min": 15000,
+  "get_ops_per_sec_min": 18000,
+  "duration_sec": 2
+}

@@ -27,6 +27,7 @@ impl CommandExecutor {
                     self.stats.total_connections(),
                     self.stats.total_commands(),
                     self.stats.total_command_usec(),
+                    self.stats.instantaneous_ops_per_sec(),
                 ),
                 commandstats_section(&commandstats),
                 persistence_section(&persistence),
@@ -39,6 +40,7 @@ impl CommandExecutor {
                 self.stats.total_connections(),
                 self.stats.total_commands(),
                 self.stats.total_command_usec(),
+                self.stats.instantaneous_ops_per_sec(),
             )],
             "commandstats" => vec![commandstats_section(&commandstats)],
             "persistence" => vec![persistence_section(&persistence)],
@@ -108,15 +110,24 @@ fn memory_section(memory_bytes: usize) -> String {
     )
 }
 
-fn stats_section(total_connections: u64, total_commands: u64, total_command_usec: u64) -> String {
+fn stats_section(
+    total_connections: u64,
+    total_commands: u64,
+    total_command_usec: u64,
+    instantaneous_ops_per_sec: u64,
+) -> String {
     let usec_per_call = if total_commands == 0 {
         0.0
     } else {
         total_command_usec as f64 / total_commands as f64
     };
     format!(
-        "# Stats\ntotal_connections_received:{}\ntotal_commands_processed:{}\ntotal_command_usec:{}\ninstantaneous_ops_per_sec:0\nusec_per_call:{:.2}",
-        total_connections, total_commands, total_command_usec, usec_per_call
+        "# Stats\ntotal_connections_received:{}\ntotal_commands_processed:{}\ntotal_command_usec:{}\ninstantaneous_ops_per_sec:{}\nusec_per_call:{:.2}",
+        total_connections,
+        total_commands,
+        total_command_usec,
+        instantaneous_ops_per_sec,
+        usec_per_call
     )
 }
 
@@ -142,13 +153,22 @@ fn commandstats_section(commandstats: &[(String, u64, u64)]) -> String {
 }
 
 fn persistence_section(metrics: &crate::store::PersistenceMetrics) -> String {
+    let last_bgsave_status = if metrics.snapshot_fail_count == 0 {
+        "ok"
+    } else {
+        "err"
+    };
     format!(
-        "# Persistence\naof_enabled:{}\naof_rewrite_in_progress:{}\naof_rewrites:{}\naof_rewrite_failures:{}\naof_last_rewrite_epoch_sec:{}",
+        "# Persistence\naof_enabled:{}\naof_rewrite_in_progress:{}\naof_rewrites:{}\naof_rewrite_failures:{}\naof_last_rewrite_epoch_sec:{}\nrdb_bgsave_in_progress:{}\nrdb_saves:{}\nrdb_last_save_time:{}\nrdb_last_bgsave_status:{}",
         if metrics.aof_enabled { 1 } else { 0 },
         if metrics.rewrite_in_progress { 1 } else { 0 },
         metrics.rewrite_count,
         metrics.rewrite_fail_count,
         metrics.last_rewrite_epoch_sec,
+        if metrics.snapshot_in_progress { 1 } else { 0 },
+        metrics.snapshot_count,
+        metrics.last_snapshot_epoch_sec,
+        last_bgsave_status,
     )
 }
 
