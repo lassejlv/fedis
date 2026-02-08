@@ -65,7 +65,7 @@ jobs:
       - name: Build and push image
         run: |
           docker buildx build \
-            --platform linux/amd64,linux/arm64 \
+            --platform linux/amd64 \
             --build-arg BUILDKIT_SYNTAX="ghcr.io/railwayapp/railpack-frontend:v${RAILPACK_VERSION}" \
             --build-arg github-token="${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}" \
             -f ./railpack-plan.json \
