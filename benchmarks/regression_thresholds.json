@@ -1,0 +1,11 @@
+{
+  "single": {
+    "set_ops_sec_min": 30000,
+    "get_ops_sec_min": 42000,
+    "ping_p99_ms_max": 0.25
+  },
+  "concurrent": {
+    "set_ops_sec_min": 35000,
+    "get_ops_sec_min": 42000
+  }
+}

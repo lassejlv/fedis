@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
-use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
@@ -253,7 +253,7 @@ async fn handle_client(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (reader_half, writer_half) = socket.into_split();
     let mut reader = BufReader::new(reader_half);
-    let mut writer = BufWriter::new(writer_half);
+    let mut writer = writer_half;
     let mut session = SessionAuth::default();
     let mut request_id = 0_u64;
 
@@ -303,7 +303,6 @@ async fn handle_client(
                 };
                 let encoded = encode(payload);
                 writer.write_all(&encoded).await?;
-                writer.flush().await?;
                 if matches!(action, SessionAction::Close) {
                     break;
                 }
@@ -322,7 +321,6 @@ async fn handle_client(
         };
 
         writer.write_all(&encode(response)).await?;
-        writer.flush().await?;
     }
 
     Ok(())

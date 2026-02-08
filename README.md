@@ -57,6 +57,8 @@ docker run --rm -p 6379:6379 fedis
 ```bash
 python3 benchmarks/run_bench.py
 python3 benchmarks/run_bench_concurrent.py
+python3 benchmarks/run_suite.py
+python3 benchmarks/check_regression.py
 ```
 
 See `ROADMAP.md` for compatibility tracking.
